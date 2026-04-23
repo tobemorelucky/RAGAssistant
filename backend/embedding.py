@@ -28,7 +28,7 @@ _DEFAULT_STATE_PATH = Path(__file__).resolve().parent.parent / "data" / "bm25_st
 def _create_dense_embedder() -> HuggingFaceEmbeddings:
     model_name = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
     device = os.getenv("EMBEDDING_DEVICE", "cpu")
-    local_only = os.getenv("EMBEDDING_LOCAL_ONLY", "0") == "1"
+    local_only = os.getenv("EMBEDDING_LOCAL_ONLY", "1") == "1"
     revision = os.getenv("EMBEDDING_REVISION", "").strip()
 
     model_kwargs = {

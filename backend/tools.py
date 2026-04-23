@@ -16,6 +16,7 @@ _LAST_RAG_CONTEXT = None
 _KNOWLEDGE_TOOL_CALLS_THIS_TURN = 0
 _RAG_STEP_QUEUE = None  # asyncio.Queue, set by agent before streaming
 _RAG_STEP_LOOP = None   # asyncio loop, captured when setting queue
+_EMPTY_KNOWLEDGE_BASE_MESSAGE = "知识库当前为空，尚未上传文档，无法基于文档检索回答。"
 
 
 def _set_last_rag_context(context: dict):
@@ -62,6 +63,26 @@ def emit_rag_step(icon: str, label: str, detail: str = ""):
                 _RAG_STEP_LOOP.call_soon_threadsafe(_RAG_STEP_QUEUE.put_nowait, step)
         except Exception:
             pass
+
+
+def _is_knowledge_base_empty() -> bool:
+    """Best-effort empty check for the knowledge base.
+
+    Return True only when we can clearly confirm the collection is missing
+    or contains no rows. If the check itself fails, fall back to normal RAG
+    flow instead of misreporting an infrastructure issue as an empty KB.
+    """
+    try:
+        from milvus_client import MilvusManager
+
+        milvus_manager = MilvusManager()
+        if not milvus_manager.has_collection():
+            return True
+
+        rows = milvus_manager.query(output_fields=["filename"], limit=1)
+        return not rows
+    except Exception:
+        return False
 
 
 def get_current_weather(location: str, extensions: Optional[str] = "base") -> str:
@@ -136,6 +157,10 @@ def search_knowledge_base(query: str) -> str:
             "Use the existing retrieval result and provide the final answer directly."
         )
     _KNOWLEDGE_TOOL_CALLS_THIS_TURN += 1
+
+    if _is_knowledge_base_empty():
+        emit_rag_step("ℹ️", "知识库为空", "尚未上传文档，已跳过检索")
+        return _EMPTY_KNOWLEDGE_BASE_MESSAGE
 
     from rag_pipeline import run_rag_graph
 

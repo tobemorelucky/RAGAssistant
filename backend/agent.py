@@ -227,6 +227,7 @@ def create_agent_instance():
             "Do not call the same tool repeatedly in one turn. At most one knowledge tool call per turn. "
             "Once you call search_knowledge_base and receive its result, you MUST immediately produce the Final Answer based on that result. "
             "After receiving search_knowledge_base result, you MUST NOT call any tool again (including get_current_weather or search_knowledge_base). "
+            "If search_knowledge_base returns '知识库当前为空，尚未上传文档，无法基于文档检索回答。', output that message directly without paraphrasing. "
             "If the retrieved context is insufficient, answer honestly that you don't know instead of making up facts. "
             "If tool results include a Step-back Question/Answer, use that general principle to reason and answer, "
             "but do not reveal chain-of-thought. "
