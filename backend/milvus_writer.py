@@ -1,6 +1,7 @@
 """文档向量化并写入 Milvus - 支持密集+稀疏向量"""
 from embedding import EmbeddingService, embedding_service as _default_embedding_service
 from milvus_client import MilvusManager
+from text_sanitizer import sanitize_text
 
 
 class MilvusWriter:
@@ -21,12 +22,13 @@ class MilvusWriter:
 
         self.milvus_manager.init_collection()
 
-        all_texts = [doc["text"] for doc in documents]
+        sanitized_documents = [{**doc, "text": sanitize_text(doc.get("text", ""))} for doc in documents]
+        all_texts = [doc["text"] for doc in sanitized_documents]
         self.embedding_service.increment_add_documents(all_texts)
 
-        total = len(documents)
+        total = len(sanitized_documents)
         for i in range(0, total, batch_size):
-            batch = documents[i:i + batch_size]
+            batch = sanitized_documents[i:i + batch_size]
             texts = [doc["text"] for doc in batch]
             
             # 同时生成密集向量和稀疏向量

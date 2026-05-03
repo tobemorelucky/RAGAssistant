@@ -5,6 +5,7 @@ from typing import List
 from cache import cache
 from database import SessionLocal
 from models import ParentChunk
+from text_sanitizer import sanitize_text
 
 
 class ParentChunkStore:
@@ -44,7 +45,7 @@ class ParentChunkStore:
 
                 record = db.query(ParentChunk).filter(ParentChunk.chunk_id == chunk_id).first()
                 payload = {
-                    "text": doc.get("text", ""),
+                    "text": sanitize_text(doc.get("text", "")),
                     "filename": doc.get("filename", ""),
                     "file_type": doc.get("file_type", ""),
                     "file_path": doc.get("file_path", ""),

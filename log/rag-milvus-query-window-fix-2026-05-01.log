@@ -1,0 +1,21 @@
+时间：2026-05-01
+
+问题：
+1. 刷新“已上传文档列表”时，Milvus 报错：
+   `invalid max query result window, (offset+limit) should be in range [1, 16384]`
+2. 根因是后端在拉取全部 chunk 时使用了 offset 分页，随着 offset 增长，
+   `offset + limit` 超过了 Milvus 的查询窗口上限 16384。
+
+本次修改：
+1. `backend/milvus_client.py`
+   - 将 `query_all()` 从 `offset + limit` 分页，改为使用 Milvus `query_iterator()` 游标式拉取。
+   - 每批读取 1000 条，直到 iterator 返回空批次。
+   - 在 `finally` 中主动关闭 iterator，避免资源泄漏。
+   - 仅在客户端没有 `query_iterator()` 方法时，保留一次性 `query(limit=QUERY_MAX_LIMIT)` 作为兼容兜底。
+
+影响：
+1. `/documents` 刷新列表时不再依赖 offset 累加，因此不会再次触发 16384 查询窗口错误。
+2. 对现有上传、入库、前端逻辑无侵入，只修复全量文档列表加载方式。
+
+验证：
+1. `python -m py_compile backend/milvus_client.py`

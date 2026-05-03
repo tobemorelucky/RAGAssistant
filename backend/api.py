@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 from pathlib import Path
@@ -10,6 +11,7 @@ from sqlalchemy.orm import Session
 from agent import chat_with_agent, chat_with_agent_stream, storage
 from auth import authenticate_user, create_access_token, get_current_user, get_db, get_password_hash, require_admin, resolve_role
 from document_loader import DocumentLoader
+from document_page_store import DocumentPageStore
 from embedding import embedding_service
 from milvus_client import MilvusManager
 from milvus_writer import MilvusWriter
@@ -20,6 +22,8 @@ from schemas import (
     ChatRequest,
     ChatResponse,
     CurrentUserResponse,
+    DocumentBatchDeleteRequest,
+    DocumentBatchDeleteStartResponse,
     DocumentDeleteJobResponse,
     DocumentDeleteResponse,
     DocumentDeleteStartResponse,
@@ -44,10 +48,12 @@ UPLOAD_DIR = DATA_DIR / "documents"
 
 loader = DocumentLoader()
 parent_chunk_store = ParentChunkStore()
+document_page_store = DocumentPageStore()
 milvus_manager = MilvusManager()
 milvus_writer = MilvusWriter(embedding_service=embedding_service, milvus_manager=milvus_manager)
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def _remove_bm25_stats_for_filename(filename: str) -> None:
@@ -194,6 +200,7 @@ def _is_supported_document(filename: str) -> bool:
         file_lower.endswith(".pdf")
         or file_lower.endswith((".docx", ".doc"))
         or file_lower.endswith((".xlsx", ".xls"))
+        or file_lower.endswith((".txt", ".md", ".csv"))
     )
 
 
@@ -229,11 +236,17 @@ def _process_upload_job(job_id: str, file_path: str, filename: str) -> None:
             parent_chunk_store.delete_by_filename(filename)
         except Exception:
             pass
+        try:
+            document_page_store.delete_by_filename(filename)
+        except Exception:
+            pass
         upload_job_manager.complete_step(job_id, "cleanup", "旧版本清理完成")
 
         failed_step = "parse"
         upload_job_manager.update_step(job_id, "parse", 5, "running", "正在解析文档并执行三级分块")
-        new_docs = loader.load_document(file_path, filename)
+        bundle = loader.load_document_bundle(file_path, filename)
+        new_docs = bundle.get("chunks", [])
+        page_docs = bundle.get("pages", [])
         if not new_docs:
             raise ValueError("文档处理失败，未能提取内容")
 
@@ -246,10 +259,17 @@ def _process_upload_job(job_id: str, file_path: str, filename: str) -> None:
             "parse",
             f"解析完成：父级分块 {len(parent_docs)} 个，叶子分块 {len(leaf_docs)} 个",
         )
+        logger.info(
+            "upload parse completed filename=%s parent_chunks=%s leaf_chunks=%s",
+            filename,
+            len(parent_docs),
+            len(leaf_docs),
+        )
 
         failed_step = "parent_store"
         upload_job_manager.update_step(job_id, "parent_store", 20, "running", "正在写入父级分块")
         parent_chunk_store.upsert_documents(parent_docs)
+        document_page_store.upsert_pages(page_docs)
         upload_job_manager.complete_step(job_id, "parent_store", f"父级分块已入库：{len(parent_docs)} 个")
 
         failed_step = "vector_store"
@@ -279,7 +299,14 @@ def _process_upload_job(job_id: str, file_path: str, filename: str) -> None:
         milvus_writer.write_documents(leaf_docs, progress_callback=_on_vector_progress)
         upload_job_manager.complete_step(job_id, "vector_store", f"向量化入库完成：{total_leaf} 个叶子分块")
         upload_job_manager.complete_job(job_id, f"成功上传并处理 {filename}")
+        logger.info(
+            "upload finished filename=%s parent_chunks=%s leaf_chunks=%s",
+            filename,
+            len(parent_docs),
+            total_leaf,
+        )
     except Exception as e:
+        logger.exception("upload failed filename=%s step=%s", filename, failed_step)
         upload_job_manager.fail_job(job_id, failed_step, str(e))
 
 
@@ -321,9 +348,8 @@ async def list_documents(_: User = Depends(require_admin)):
     try:
         milvus_manager.init_collection()
 
-        results = milvus_manager.query(
+        results = milvus_manager.query_all(
             output_fields=["filename", "file_type"],
-            limit=10000,
         )
 
         file_stats = {}
@@ -338,7 +364,15 @@ async def list_documents(_: User = Depends(require_admin)):
                 }
             file_stats[filename]["chunk_count"] += 1
 
-        documents = [DocumentInfo(**stats) for stats in file_stats.values()]
+        documents = [
+            DocumentInfo(**stats)
+            for stats in sorted(file_stats.values(), key=lambda item: item["filename"].lower())
+        ]
+        logger.info(
+            "document list refreshed rows=%s documents=%s",
+            len(results),
+            len(documents),
+        )
         return DocumentListResponse(documents=documents)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"获取文档列表失败: {str(e)}")
@@ -354,7 +388,7 @@ async def upload_document_async(
     if not filename:
         raise HTTPException(status_code=400, detail="文件名不能为空")
     if not _is_supported_document(filename):
-        raise HTTPException(status_code=400, detail="仅支持 PDF、Word 和 Excel 文档")
+        raise HTTPException(status_code=400, detail="仅支持 PDF、Word、Excel、TXT、Markdown 和 CSV 文档")
 
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     job = upload_job_manager.create_job(filename)
@@ -389,6 +423,49 @@ async def list_upload_jobs(_: User = Depends(require_admin)):
     jobs = upload_job_manager.list_jobs()
     jobs.sort(key=lambda item: item.get("created_at", ""), reverse=True)
     return [DocumentUploadJobResponse(**job) for job in jobs]
+
+
+@router.post("/documents/delete/async/batch", response_model=DocumentBatchDeleteStartResponse)
+async def delete_documents_async_batch(
+    request: DocumentBatchDeleteRequest,
+    background_tasks: BackgroundTasks,
+    _: User = Depends(require_admin),
+):
+    filenames = []
+    seen = set()
+    for item in request.filenames:
+        filename = (item or "").strip()
+        if not filename or filename in seen:
+            continue
+        seen.add(filename)
+        filenames.append(filename)
+
+    if not filenames:
+        raise HTTPException(status_code=400, detail="至少提供一个有效的文件名")
+
+    jobs = []
+    for filename in filenames:
+        job = delete_job_manager.create_job(
+            filename,
+            steps=DELETE_STEPS,
+            current_step="prepare",
+            message="等待删除",
+            completion_step="parent_store",
+        )
+        delete_job_manager.update_step(job["job_id"], "prepare", 1, "running", "删除任务已提交")
+        background_tasks.add_task(_process_delete_job, job["job_id"], filename)
+        jobs.append(
+            DocumentDeleteStartResponse(
+                job_id=job["job_id"],
+                filename=filename,
+                message=f"正在删除 {filename}",
+            )
+        )
+
+    return DocumentBatchDeleteStartResponse(
+        jobs=jobs,
+        message=f"已提交 {len(jobs)} 个文档删除任务",
+    )
 
 
 @router.delete("/documents/delete/async/{filename}", response_model=DocumentDeleteStartResponse)
@@ -434,8 +511,9 @@ async def upload_document(file: UploadFile = File(...), _: User = Depends(requir
             file_lower.endswith(".pdf")
             or file_lower.endswith((".docx", ".doc"))
             or file_lower.endswith((".xlsx", ".xls"))
+            or file_lower.endswith((".txt", ".md", ".csv"))
         ):
-            raise HTTPException(status_code=400, detail="仅支持 PDF、Word 和 Excel 文档")
+            raise HTTPException(status_code=400, detail="仅支持 PDF、Word、Excel、TXT、Markdown 和 CSV 文档")
 
         os.makedirs(UPLOAD_DIR, exist_ok=True)
         milvus_manager.init_collection()
@@ -460,7 +538,9 @@ async def upload_document(file: UploadFile = File(...), _: User = Depends(requir
             f.write(content)
 
         try:
-            new_docs = loader.load_document(str(file_path), filename)
+            bundle = loader.load_document_bundle(str(file_path), filename)
+            new_docs = bundle.get("chunks", [])
+            page_docs = bundle.get("pages", [])
         except Exception as doc_err:
             raise HTTPException(status_code=500, detail=f"文档处理失败: {doc_err}")
 
@@ -473,6 +553,7 @@ async def upload_document(file: UploadFile = File(...), _: User = Depends(requir
             raise HTTPException(status_code=500, detail="文档处理失败，未生成可检索叶子分块")
 
         parent_chunk_store.upsert_documents(parent_docs)
+        document_page_store.upsert_pages(page_docs)
         milvus_writer.write_documents(leaf_docs)
 
         return DocumentUploadResponse(
@@ -499,6 +580,7 @@ async def delete_document(filename: str, _: User = Depends(require_admin)):
         _remove_bm25_stats_for_filename(filename)
         result = milvus_manager.delete(delete_expr)
         parent_chunk_store.delete_by_filename(filename)
+        document_page_store.delete_by_filename(filename)
 
         return DocumentDeleteResponse(
             filename=filename,

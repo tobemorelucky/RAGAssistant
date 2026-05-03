@@ -185,8 +185,10 @@ def search_knowledge_base(query: str) -> str:
     formatted = []
     for i, result in enumerate(docs, 1):
         source = result.get("filename", "Unknown")
+        doc_name = result.get("doc_name", "") or source.rsplit(".", 1)[0]
         page = result.get("page_number", "N/A")
+        evidence_type = result.get("type", "chunk") or "chunk"
         text = result.get("text", "")
-        formatted.append(f"[{i}] {source} (Page {page}):\n{text}")
+        formatted.append(f"[{i}] {doc_name} | {source} | Page {page} | Type {evidence_type}:\n{text}")
 
     return "Retrieved Chunks:\n" + "\n\n---\n\n".join(formatted)

@@ -1,22 +1,32 @@
-from typing import Literal, TypedDict, List, Optional
+from typing import List, Optional, TypedDict
+import json
+import logging
 import os
+
 from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
-from langgraph.graph import StateGraph, END
+from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
-from rag_utils import retrieve_documents, step_back_expand, generate_hypothetical_document
+from rag_utils import (
+    finalize_retrieved_documents,
+    get_doc_name,
+    get_finance_rag_config,
+    retrieve_candidate_documents,
+    retrieve_documents,
+    step_back_expand,
+)
 from tools import emit_rag_step
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 API_KEY = os.getenv("ARK_API_KEY")
-MODEL = os.getenv("MODEL")
-BASE_URL = os.getenv("BASE_URL")
 GRADE_MODEL = os.getenv("GRADE_MODEL", "gpt-4.1")
+BASE_URL = os.getenv("BASE_URL")
 
 _grader_model = None
-_router_model = None
 
 
 def _get_grader_model():
@@ -35,43 +45,17 @@ def _get_grader_model():
     return _grader_model
 
 
-def _get_router_model():
-    global _router_model
-    if not API_KEY or not MODEL:
-        return None
-    if _router_model is None:
-        _router_model = init_chat_model(
-            model=MODEL,
-            model_provider="openai",
-            api_key=API_KEY,
-            base_url=BASE_URL,
-            temperature=0,
-            stream_usage=True,
-        )
-    return _router_model
-
-
 GRADE_PROMPT = (
-    "You are a grader assessing relevance of a retrieved document to a user question. \n "
-    "Here is the retrieved document: \n\n {context} \n\n"
-    "Here is the user question: {question} \n"
-    "If the document contains keyword(s) or semantic meaning related to the user question, grade it as relevant. \n"
-    "Give a binary score 'yes' or 'no' score to indicate whether the document is relevant to the question."
+    "You are a grader assessing relevance of retrieved documents to a user question.\n"
+    "Retrieved context:\n\n{context}\n\n"
+    "User question:\n{question}\n\n"
+    "If the retrieved documents are likely sufficient to answer the question, output yes.\n"
+    "Otherwise output no."
 )
 
 
 class GradeDocuments(BaseModel):
-    """Grade documents using a binary score for relevance check."""
-
-    binary_score: str = Field(
-        description="Relevance score: 'yes' if relevant, or 'no' if not relevant"
-    )
-
-
-class RewriteStrategy(BaseModel):
-    """Choose a query expansion strategy."""
-
-    strategy: Literal["step_back", "hyde", "complex"]
+    binary_score: str = Field(description="Relevance score: 'yes' if relevant, or 'no' if not relevant")
 
 
 class RAGState(TypedDict):
@@ -80,11 +64,12 @@ class RAGState(TypedDict):
     context: str
     docs: List[dict]
     route: Optional[str]
-    expansion_type: Optional[str]
-    expanded_query: Optional[str]
+    rewritten_question: Optional[str]
+    rewrite_used: Optional[bool]
     step_back_question: Optional[str]
     step_back_answer: Optional[str]
-    hypothetical_doc: Optional[str]
+    initial_candidate_docs: List[dict]
+    expanded_candidate_docs: List[dict]
     rag_trace: Optional[dict]
 
 
@@ -94,271 +79,386 @@ def _format_docs(docs: List[dict]) -> str:
     chunks = []
     for i, doc in enumerate(docs, 1):
         source = doc.get("filename", "Unknown")
+        doc_name = doc.get("doc_name") or get_doc_name(source)
         page = doc.get("page_number", "N/A")
+        evidence_type = doc.get("type", "chunk") or "chunk"
         text = doc.get("text", "")
-        chunks.append(f"[{i}] {source} (Page {page}):\n{text}")
+        chunks.append(f"[{i}] {doc_name} | {source} | Page {page} | Type {evidence_type}:\n{text}")
     return "\n\n---\n\n".join(chunks)
 
 
+def _deduplicate_docs(docs: List[dict]) -> List[dict]:
+    out: List[dict] = []
+    seen = set()
+    for doc in docs:
+        key = (
+            doc.get("chunk_id") or "",
+            doc.get("filename") or "",
+            doc.get("page_number"),
+            doc.get("chunk_idx"),
+            doc.get("text") or "",
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(doc)
+    return out
+
+
+def _as_float(value) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_trace_chunks(docs: List[dict]) -> List[dict]:
+    normalized = []
+    for idx, doc in enumerate(docs, 1):
+        filename = doc.get("filename", "") or ""
+        page_number = doc.get("page_number", "")
+        source = filename
+        if filename and page_number not in ("", None):
+            source = f"{filename}#page={page_number}"
+        normalized.append(
+            {
+                "rank": idx,
+                "filename": filename,
+                "doc_name": doc.get("doc_name") or get_doc_name(filename),
+                "page_number": page_number if page_number is not None else "",
+                "type": doc.get("type", "") or "",
+                "text": doc.get("text", "") or "",
+                "score": _as_float(doc.get("score")),
+                "rerank_score": _as_float(doc.get("rerank_score")),
+                "source": source,
+                "chunk_id": doc.get("chunk_id", "") or "",
+            }
+        )
+    return normalized
+
+
+def _page_distribution(chunks: List[dict]) -> dict:
+    distribution: dict = {}
+    for chunk in chunks:
+        page = chunk.get("page_number")
+        key = "" if page is None else str(page)
+        distribution[key] = distribution.get(key, 0) + 1
+    return distribution
+
+
+def _update_trace_from_finalization(trace: dict, finalization: dict) -> dict:
+    meta = finalization.get("meta", {})
+    final_docs = finalization.get("final_retrieved_docs", [])
+    context_docs = finalization.get("context_docs", [])
+    trace.update(
+        {
+            "retrieved_chunks": _normalize_trace_chunks(context_docs or final_docs),
+            "final_retrieved_chunks": _normalize_trace_chunks(final_docs),
+            "page_stage_candidates": _normalize_trace_chunks(meta.get("page_stage_candidates", []) or []),
+            "doc_stage_selected_docs": meta.get("doc_stage_selected_docs", []) or [],
+            "selected_docs": meta.get("selected_docs", []) or meta.get("doc_stage_selected_docs", []) or [],
+            "selected_pages": meta.get("selected_pages", []) or [],
+            "page_scores": meta.get("page_scores", []) or [],
+            "final_evidence_pack": _normalize_trace_chunks(meta.get("final_evidence_pack", []) or context_docs or final_docs),
+            "two_stage_retrieval": meta.get("two_stage_retrieval"),
+            "doc_stage_top_n": meta.get("doc_stage_top_n"),
+            "page_stage_top_n": meta.get("page_stage_top_n"),
+            "rerank_enabled": meta.get("rerank_enabled"),
+            "rerank_applied": meta.get("rerank_applied"),
+            "rerank_model": meta.get("rerank_model"),
+            "rerank_endpoint": meta.get("rerank_endpoint"),
+            "rerank_error": meta.get("rerank_error"),
+            "auto_merge_enabled": meta.get("auto_merge_enabled"),
+            "auto_merge_applied": meta.get("auto_merge_applied"),
+            "auto_merge_threshold": meta.get("auto_merge_threshold"),
+            "auto_merge_replaced_chunks": meta.get("auto_merge_replaced_chunks"),
+            "auto_merge_steps": meta.get("auto_merge_steps"),
+            "page_merge_applied": meta.get("page_merge_applied"),
+            "merged_chunk_count": meta.get("merged_chunk_count"),
+            "final_context_chunk_count": meta.get("final_context_chunk_count"),
+            "cover_page_filtered_count": meta.get("cover_page_filtered_count"),
+            "fallback_used": meta.get("fallback_used"),
+        }
+    )
+    return trace
+
+
+def _log_rag_diagnostics(rag_trace: dict | None) -> None:
+    if not rag_trace:
+        return
+    final_chunks = rag_trace.get("final_retrieved_chunks", []) or []
+    final_page_distribution = _page_distribution(final_chunks)
+    payload = {
+        "original_question": rag_trace.get("original_question"),
+        "rewritten_question": rag_trace.get("rewritten_question"),
+        "rewrite_used": rag_trace.get("rewrite_used"),
+        "rewrite_strategy": rag_trace.get("rewrite_strategy"),
+        "candidate_k": rag_trace.get("candidate_k"),
+        "final_top_k": rag_trace.get("final_top_k"),
+        "two_stage_retrieval": rag_trace.get("two_stage_retrieval"),
+        "doc_stage_selected_docs": rag_trace.get("doc_stage_selected_docs"),
+        "selected_pages": [
+            {
+                "filename": page.get("filename"),
+                "page_number": page.get("page_number"),
+                "page_score": page.get("page_score"),
+                "type": page.get("type"),
+            }
+            for page in rag_trace.get("selected_pages", []) or []
+        ],
+        "final_evidence_pack_count": len(rag_trace.get("final_evidence_pack", []) or []),
+        "initial_retrieved": [
+            {
+                "filename": chunk.get("filename"),
+                "page_number": chunk.get("page_number"),
+                "score": chunk.get("score"),
+                "rerank_score": chunk.get("rerank_score"),
+            }
+            for chunk in rag_trace.get("initial_retrieved_chunks", []) or []
+        ],
+        "expanded_retrieved": [
+            {
+                "filename": chunk.get("filename"),
+                "page_number": chunk.get("page_number"),
+                "score": chunk.get("score"),
+                "rerank_score": chunk.get("rerank_score"),
+            }
+            for chunk in rag_trace.get("expanded_retrieved_chunks", []) or []
+        ],
+        "final_retrieved": [
+            {
+                "filename": chunk.get("filename"),
+                "page_number": chunk.get("page_number"),
+                "score": chunk.get("score"),
+                "rerank_score": chunk.get("rerank_score"),
+            }
+            for chunk in rag_trace.get("final_retrieved_chunks", []) or []
+        ],
+        "final_retrieved_chunk_count": len(final_chunks),
+        "final_retrieved_page_distribution": final_page_distribution,
+        "final_retrieved_page_zero_count": sum(
+            count for page, count in final_page_distribution.items() if page in {"", "0"}
+        ),
+        "page_merge_applied": rag_trace.get("page_merge_applied"),
+        "merged_chunk_count": rag_trace.get("merged_chunk_count"),
+        "final_context_chunk_count": rag_trace.get("final_context_chunk_count"),
+        "cover_page_filtered_count": rag_trace.get("cover_page_filtered_count"),
+        "fallback_used": rag_trace.get("fallback_used"),
+    }
+    logger.info("finance_rag_trace %s", json.dumps(payload, ensure_ascii=False))
+
+
 def retrieve_initial(state: RAGState) -> RAGState:
+    config = get_finance_rag_config()
     query = state["question"]
-    emit_rag_step("🔍", "正在检索知识库...", f"查询: {query[:50]}")
-    retrieved = retrieve_documents(query, top_k=5)
-    results = retrieved.get("docs", [])
+    emit_rag_step("🔍", "正在检索知识库...", f"问题: {query[:120]}")
+    retrieved = retrieve_documents(
+        query,
+        top_k=config["final_top_k"],
+        candidate_k=config["candidate_k"],
+        apply_page_merge=config["enable_page_merge"],
+    )
+
+    initial_candidates = retrieved.get("candidate_docs", [])
+    final_docs = retrieved.get("final_retrieved_docs", [])
+    context_docs = retrieved.get("context_docs", [])
     retrieve_meta = retrieved.get("meta", {})
-    context = _format_docs(results)
+    context = _format_docs(context_docs)
+
     emit_rag_step(
         "🧱",
-        "三级分块检索",
-        (
-            f"叶子层 L{retrieve_meta.get('leaf_retrieve_level', 3)} 召回，"
-            f"候选 {retrieve_meta.get('candidate_k', 0)}"
-        ),
+        "候选召回",
+        f"candidate_k={config['candidate_k']}，召回 {len(initial_candidates)} 个候选块",
     )
     emit_rag_step(
-        "🧩",
-        "Auto-merging 合并",
-        (
-            f"启用: {bool(retrieve_meta.get('auto_merge_enabled'))}，"
-            f"应用: {bool(retrieve_meta.get('auto_merge_applied'))}，"
-            f"替换片段: {retrieve_meta.get('auto_merge_replaced_chunks', 0)}"
-        ),
+        "📚",
+        "最终上下文",
+        f"final_top_k={config['final_top_k']}，上下文块 {len(context_docs)} 个",
     )
-    emit_rag_step("✅", f"检索完成，找到 {len(results)} 个片段", f"模式: {retrieve_meta.get('retrieval_mode', 'hybrid')}")
+
     rag_trace = {
         "tool_used": True,
         "tool_name": "search_knowledge_base",
         "query": query,
-        "expanded_query": query,
-        "retrieved_chunks": results,
-        "initial_retrieved_chunks": results,
+        "original_question": query,
+        "rewritten_question": query,
+        "rewrite_used": False,
+        "rewrite_strategy": "none",
+        "candidate_k": config["candidate_k"],
+        "final_top_k": config["final_top_k"],
+        "two_stage_retrieval": config["two_stage_retrieval"],
+        "doc_stage_top_n": config["doc_stage_top_n"],
+        "page_stage_top_n": config["page_stage_top_n"],
+        "initial_retrieved_chunks": _normalize_trace_chunks(initial_candidates),
+        "expanded_retrieved_chunks": [],
         "retrieval_stage": "initial",
-        "rerank_enabled": retrieve_meta.get("rerank_enabled"),
-        "rerank_applied": retrieve_meta.get("rerank_applied"),
-        "rerank_model": retrieve_meta.get("rerank_model"),
-        "rerank_endpoint": retrieve_meta.get("rerank_endpoint"),
-        "rerank_error": retrieve_meta.get("rerank_error"),
         "retrieval_mode": retrieve_meta.get("retrieval_mode"),
-        "candidate_k": retrieve_meta.get("candidate_k"),
         "leaf_retrieve_level": retrieve_meta.get("leaf_retrieve_level"),
-        "auto_merge_enabled": retrieve_meta.get("auto_merge_enabled"),
-        "auto_merge_applied": retrieve_meta.get("auto_merge_applied"),
-        "auto_merge_threshold": retrieve_meta.get("auto_merge_threshold"),
-        "auto_merge_replaced_chunks": retrieve_meta.get("auto_merge_replaced_chunks"),
-        "auto_merge_steps": retrieve_meta.get("auto_merge_steps"),
+        "step_back_question": "",
+        "step_back_answer": "",
     }
+    rag_trace = _update_trace_from_finalization(
+        rag_trace,
+        {
+            "final_retrieved_docs": final_docs,
+            "context_docs": context_docs,
+            "meta": retrieve_meta,
+        },
+    )
+
     return {
         "query": query,
-        "docs": results,
+        "docs": context_docs,
         "context": context,
+        "initial_candidate_docs": initial_candidates,
+        "expanded_candidate_docs": [],
+        "rewritten_question": query,
+        "rewrite_used": False,
+        "step_back_question": "",
+        "step_back_answer": "",
         "rag_trace": rag_trace,
     }
 
 
 def grade_documents_node(state: RAGState) -> RAGState:
-    grader = _get_grader_model()
-    emit_rag_step("📊", "正在评估文档相关性...")
-    if not grader:
-        grade_update = {
-            "grade_score": "unknown",
-            "grade_route": "rewrite_question",
-            "rewrite_needed": True,
-        }
+    config = get_finance_rag_config()
+    if not config["enable_step_back"]:
         rag_trace = state.get("rag_trace", {}) or {}
-        rag_trace.update(grade_update)
+        rag_trace.update(
+            {
+                "grade_score": "skipped",
+                "grade_route": "generate_answer",
+                "rewrite_needed": False,
+                "rewrite_used": False,
+                "rewrite_strategy": "none",
+                "rewritten_question": state["question"],
+            }
+        )
+        return {"route": "generate_answer", "rag_trace": rag_trace}
+
+    grader = _get_grader_model()
+    emit_rag_step("📊", "正在评估当前检索是否足够...")
+    if not grader:
+        rag_trace = state.get("rag_trace", {}) or {}
+        rag_trace.update(
+            {
+                "grade_score": "unknown",
+                "grade_route": "rewrite_question",
+                "rewrite_needed": True,
+            }
+        )
         return {"route": "rewrite_question", "rag_trace": rag_trace}
+
     question = state["question"]
     context = state.get("context", "")
-    prompt = GRADE_PROMPT.format(question=question, context=context)
     response = grader.with_structured_output(GradeDocuments).invoke(
-        [{"role": "user", "content": prompt}]
+        [{"role": "user", "content": GRADE_PROMPT.format(question=question, context=context)}]
     )
     score = (response.binary_score or "").strip().lower()
     route = "generate_answer" if score == "yes" else "rewrite_question"
-    if route == "generate_answer":
-        emit_rag_step("✅", "文档相关性评估通过", f"评分: {score}")
-    else:
-        emit_rag_step("⚠️", "文档相关性不足，将重写查询", f"评分: {score}")
-    grade_update = {
-        "grade_score": score,
-        "grade_route": route,
-        "rewrite_needed": route == "rewrite_question",
-    }
+    emit_rag_step("✅" if route == "generate_answer" else "⚠️", "相关性判断完成", f"结果: {route}")
     rag_trace = state.get("rag_trace", {}) or {}
-    rag_trace.update(grade_update)
+    rag_trace.update(
+        {
+            "grade_score": score,
+            "grade_route": route,
+            "rewrite_needed": route == "rewrite_question",
+        }
+    )
     return {"route": route, "rag_trace": rag_trace}
 
 
 def rewrite_question_node(state: RAGState) -> RAGState:
+    config = get_finance_rag_config()
+    if not config["enable_step_back"]:
+        return {
+            "rewritten_question": state["question"],
+            "rewrite_used": False,
+            "step_back_question": "",
+            "step_back_answer": "",
+            "rag_trace": {
+                **(state.get("rag_trace", {}) or {}),
+                "rewrite_used": False,
+                "rewrite_strategy": "none",
+                "rewritten_question": state["question"],
+            },
+        }
+
     question = state["question"]
-    emit_rag_step("✏️", "正在重写查询...")
-    router = _get_router_model()
-    strategy = "step_back"
-    if router:
-        prompt = (
-            "请根据用户问题选择最合适的查询扩展策略，仅输出策略名。\n"
-            "- step_back：包含具体名称、日期、代码等细节，需要先理解通用概念的问题。\n"
-            "- hyde：模糊、概念性、需要解释或定义的问题。\n"
-            "- complex：多步骤、需要分解或综合多种信息的复杂问题。\n"
-            f"用户问题：{question}"
-        )
-        try:
-            decision = router.with_structured_output(RewriteStrategy).invoke(
-                [{"role": "user", "content": prompt}]
-            )
-            strategy = decision.strategy
-        except Exception:
-            strategy = "step_back"
-
-    expanded_query = question
-    step_back_question = ""
-    step_back_answer = ""
-    hypothetical_doc = ""
-
-    if strategy in ("step_back", "complex"):
-        emit_rag_step("🧠", f"使用策略: {strategy}", "生成退步问题")
-        step_back = step_back_expand(question)
-        step_back_question = step_back.get("step_back_question", "")
-        step_back_answer = step_back.get("step_back_answer", "")
-        expanded_query = step_back.get("expanded_query", question)
-
-    if strategy in ("hyde", "complex"):
-        emit_rag_step("📝", "HyDE 假设性文档生成中...")
-        hypothetical_doc = generate_hypothetical_document(question)
+    emit_rag_step("✏️", "正在生成保守改写...", "保留公司名、年份、指标名、单位等关键词")
+    step_back = step_back_expand(question)
+    rewritten_question = (step_back.get("expanded_query") or question).strip() or question
+    rewrite_used = rewritten_question != question
 
     rag_trace = state.get("rag_trace", {}) or {}
-    rag_trace.update({
-        "rewrite_strategy": strategy,
-        "rewrite_query": expanded_query,
-    })
-
+    rag_trace.update(
+        {
+            "rewrite_used": rewrite_used,
+            "rewrite_strategy": "step_back" if rewrite_used else "none",
+            "rewritten_question": rewritten_question,
+            "step_back_question": step_back.get("step_back_question", "") or "",
+            "step_back_answer": step_back.get("step_back_answer", "") or "",
+        }
+    )
     return {
-        "expansion_type": strategy,
-        "expanded_query": expanded_query,
-        "step_back_question": step_back_question,
-        "step_back_answer": step_back_answer,
-        "hypothetical_doc": hypothetical_doc,
+        "rewritten_question": rewritten_question,
+        "rewrite_used": rewrite_used,
+        "step_back_question": step_back.get("step_back_question", "") or "",
+        "step_back_answer": step_back.get("step_back_answer", "") or "",
         "rag_trace": rag_trace,
     }
 
 
 def retrieve_expanded(state: RAGState) -> RAGState:
-    strategy = state.get("expansion_type") or "step_back"
-    emit_rag_step("🔄", "使用扩展查询重新检索...", f"策略: {strategy}")
-    results: List[dict] = []
-    rerank_applied_any = False
-    rerank_enabled_any = False
-    rerank_model = None
-    rerank_endpoint = None
-    rerank_errors = []
-    retrieval_mode = None
-    candidate_k = None
-    leaf_retrieve_level = None
-    auto_merge_enabled = None
-    auto_merge_applied = False
-    auto_merge_threshold = None
-    auto_merge_replaced_chunks = 0
-    auto_merge_steps = 0
+    config = get_finance_rag_config()
+    rewritten_question = (state.get("rewritten_question") or state["question"]).strip()
+    rewrite_used = bool(state.get("rewrite_used")) and rewritten_question != state["question"]
 
-    if strategy in ("hyde", "complex"):
-        hypothetical_doc = state.get("hypothetical_doc") or generate_hypothetical_document(state["question"])
-        retrieved_hyde = retrieve_documents(hypothetical_doc, top_k=5)
-        results.extend(retrieved_hyde.get("docs", []))
-        hyde_meta = retrieved_hyde.get("meta", {})
-        emit_rag_step(
-            "🧱",
-            "HyDE 三级检索",
-            (
-                f"L{hyde_meta.get('leaf_retrieve_level', 3)} 召回，"
-                f"候选 {hyde_meta.get('candidate_k', 0)}，"
-                f"合并替换 {hyde_meta.get('auto_merge_replaced_chunks', 0)}"
-            ),
-        )
-        rerank_applied_any = rerank_applied_any or bool(hyde_meta.get("rerank_applied"))
-        rerank_enabled_any = rerank_enabled_any or bool(hyde_meta.get("rerank_enabled"))
-        rerank_model = rerank_model or hyde_meta.get("rerank_model")
-        rerank_endpoint = rerank_endpoint or hyde_meta.get("rerank_endpoint")
-        if hyde_meta.get("rerank_error"):
-            rerank_errors.append(f"hyde:{hyde_meta.get('rerank_error')}")
-        retrieval_mode = retrieval_mode or hyde_meta.get("retrieval_mode")
-        candidate_k = candidate_k or hyde_meta.get("candidate_k")
-        leaf_retrieve_level = leaf_retrieve_level or hyde_meta.get("leaf_retrieve_level")
-        auto_merge_enabled = auto_merge_enabled if auto_merge_enabled is not None else hyde_meta.get("auto_merge_enabled")
-        auto_merge_applied = auto_merge_applied or bool(hyde_meta.get("auto_merge_applied"))
-        auto_merge_threshold = auto_merge_threshold or hyde_meta.get("auto_merge_threshold")
-        auto_merge_replaced_chunks += int(hyde_meta.get("auto_merge_replaced_chunks") or 0)
-        auto_merge_steps += int(hyde_meta.get("auto_merge_steps") or 0)
+    if not rewrite_used:
+        return {"rag_trace": state.get("rag_trace")}
 
-    if strategy in ("step_back", "complex"):
-        expanded_query = state.get("expanded_query") or state["question"]
-        retrieved_stepback = retrieve_documents(expanded_query, top_k=5)
-        results.extend(retrieved_stepback.get("docs", []))
-        step_meta = retrieved_stepback.get("meta", {})
-        emit_rag_step(
-            "🧱",
-            "Step-back 三级检索",
-            (
-                f"L{step_meta.get('leaf_retrieve_level', 3)} 召回，"
-                f"候选 {step_meta.get('candidate_k', 0)}，"
-                f"合并替换 {step_meta.get('auto_merge_replaced_chunks', 0)}"
-            ),
-        )
-        rerank_applied_any = rerank_applied_any or bool(step_meta.get("rerank_applied"))
-        rerank_enabled_any = rerank_enabled_any or bool(step_meta.get("rerank_enabled"))
-        rerank_model = rerank_model or step_meta.get("rerank_model")
-        rerank_endpoint = rerank_endpoint or step_meta.get("rerank_endpoint")
-        if step_meta.get("rerank_error"):
-            rerank_errors.append(f"step_back:{step_meta.get('rerank_error')}")
-        retrieval_mode = retrieval_mode or step_meta.get("retrieval_mode")
-        candidate_k = candidate_k or step_meta.get("candidate_k")
-        leaf_retrieve_level = leaf_retrieve_level or step_meta.get("leaf_retrieve_level")
-        auto_merge_enabled = auto_merge_enabled if auto_merge_enabled is not None else step_meta.get("auto_merge_enabled")
-        auto_merge_applied = auto_merge_applied or bool(step_meta.get("auto_merge_applied"))
-        auto_merge_threshold = auto_merge_threshold or step_meta.get("auto_merge_threshold")
-        auto_merge_replaced_chunks += int(step_meta.get("auto_merge_replaced_chunks") or 0)
-        auto_merge_steps += int(step_meta.get("auto_merge_steps") or 0)
+    emit_rag_step("🔄", "使用改写问题补充召回...", rewritten_question[:120])
+    expanded = retrieve_candidate_documents(rewritten_question, candidate_k=config["candidate_k"])
+    expanded_candidates = expanded.get("docs", [])
+    combined_candidates = _deduplicate_docs((state.get("initial_candidate_docs") or []) + expanded_candidates)
 
-    deduped = []
-    seen = set()
-    for item in results:
-        key = (item.get("filename"), item.get("page_number"), item.get("text"))
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(item)
+    finalization = finalize_retrieved_documents(
+        state["question"],
+        combined_candidates,
+        final_top_k=config["final_top_k"],
+        enable_page_merge=config["enable_page_merge"],
+        adjacent_page_window=config["adjacent_page_window"],
+        adjacent_chunk_window=config["adjacent_chunk_window"],
+    )
+    final_docs = finalization.get("final_retrieved_docs", [])
+    context_docs = finalization.get("context_docs", [])
+    context = _format_docs(context_docs)
 
-    # 扩展阶段可能合并了多路召回（如 hyde + step_back），
-    # 这里统一重排展示名次，避免出现 1,2,3,4,5,4,5 这类重复名次。
-    for idx, item in enumerate(deduped, 1):
-        item["rrf_rank"] = idx
+    emit_rag_step(
+        "📚",
+        "统一重排完成",
+        f"初始 {len(state.get('initial_candidate_docs') or [])} + 改写 {len(expanded_candidates)} -> 最终 {len(final_docs)}",
+    )
 
-    context = _format_docs(deduped)
-    emit_rag_step("✅", f"扩展检索完成，共 {len(deduped)} 个片段")
     rag_trace = state.get("rag_trace", {}) or {}
-    rag_trace.update({
-        "expanded_query": state.get("expanded_query") or state["question"],
-        "step_back_question": state.get("step_back_question", ""),
-        "step_back_answer": state.get("step_back_answer", ""),
-        "hypothetical_doc": state.get("hypothetical_doc", ""),
-        "expansion_type": strategy,
-        "retrieved_chunks": deduped,
-        "expanded_retrieved_chunks": deduped,
-        "retrieval_stage": "expanded",
-        "rerank_enabled": rerank_enabled_any,
-        "rerank_applied": rerank_applied_any,
-        "rerank_model": rerank_model,
-        "rerank_endpoint": rerank_endpoint,
-        "rerank_error": "; ".join(rerank_errors) if rerank_errors else None,
-        "retrieval_mode": retrieval_mode,
-        "candidate_k": candidate_k,
-        "leaf_retrieve_level": leaf_retrieve_level,
-        "auto_merge_enabled": auto_merge_enabled,
-        "auto_merge_applied": auto_merge_applied,
-        "auto_merge_threshold": auto_merge_threshold,
-        "auto_merge_replaced_chunks": auto_merge_replaced_chunks,
-        "auto_merge_steps": auto_merge_steps,
-    })
-    return {"docs": deduped, "context": context, "rag_trace": rag_trace}
+    rag_trace.update(
+        {
+            "expanded_retrieved_chunks": _normalize_trace_chunks(expanded_candidates),
+            "rewrite_used": True,
+            "rewrite_strategy": "step_back",
+            "rewritten_question": rewritten_question,
+            "retrieval_stage": "expanded",
+            "retrieval_mode": expanded.get("meta", {}).get("retrieval_mode"),
+        }
+    )
+    rag_trace = _update_trace_from_finalization(rag_trace, finalization)
+
+    return {
+        "docs": context_docs,
+        "context": context,
+        "expanded_candidate_docs": expanded_candidates,
+        "rag_trace": rag_trace,
+    }
 
 
 def build_rag_graph():
@@ -387,16 +487,21 @@ rag_graph = build_rag_graph()
 
 
 def run_rag_graph(question: str) -> dict:
-    return rag_graph.invoke({
-        "question": question,
-        "query": question,
-        "context": "",
-        "docs": [],
-        "route": None,
-        "expansion_type": None,
-        "expanded_query": None,
-        "step_back_question": None,
-        "step_back_answer": None,
-        "hypothetical_doc": None,
-        "rag_trace": None,
-    })
+    result = rag_graph.invoke(
+        {
+            "question": question,
+            "query": question,
+            "context": "",
+            "docs": [],
+            "route": None,
+            "rewritten_question": None,
+            "rewrite_used": None,
+            "step_back_question": None,
+            "step_back_answer": None,
+            "initial_candidate_docs": [],
+            "expanded_candidate_docs": [],
+            "rag_trace": None,
+        }
+    )
+    _log_rag_diagnostics(result.get("rag_trace") if isinstance(result, dict) else None)
+    return result

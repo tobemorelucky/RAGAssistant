@@ -60,3 +60,19 @@ class ParentChunk(Base):
     chunk_level: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     chunk_idx: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class DocumentPage(Base):
+    __tablename__ = "document_pages"
+    __table_args__ = (UniqueConstraint("filename", "page_number", name="uq_document_page"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    doc_name: Mapped[str] = mapped_column(String(255), default="", nullable=False, index=True)
+    filename: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    file_type: Mapped[str] = mapped_column(String(50), default="", nullable=False)
+    file_path: Mapped[str] = mapped_column(String(1024), default="", nullable=False)
+    page_number: Mapped[int] = mapped_column(Integer, default=0, nullable=False, index=True)
+    page_text: Mapped[str] = mapped_column(Text, nullable=False)
+    table_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    chunk_ids: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)

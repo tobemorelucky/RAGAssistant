@@ -32,18 +32,25 @@ class ChatRequest(BaseModel):
 
 
 class RetrievedChunk(BaseModel):
+    rank: Optional[int] = None
     filename: str
+    doc_name: Optional[str] = None
     page_number: Optional[str | int] = None
+    type: Optional[str] = None
     text: Optional[str] = None
     score: Optional[float] = None
     rrf_rank: Optional[int] = None
     rerank_score: Optional[float] = None
+    source: Optional[str] = None
+    chunk_id: Optional[str] = None
 
 
 class RagTrace(BaseModel):
     tool_used: bool
     tool_name: str
     query: Optional[str] = None
+    original_question: Optional[str] = None
+    rewritten_question: Optional[str] = None
     expanded_query: Optional[str] = None
     step_back_question: Optional[str] = None
     step_back_answer: Optional[str] = None
@@ -53,6 +60,7 @@ class RagTrace(BaseModel):
     grade_score: Optional[str] = None
     grade_route: Optional[str] = None
     rewrite_needed: Optional[bool] = None
+    rewrite_used: Optional[bool] = None
     rewrite_strategy: Optional[str] = None
     rewrite_query: Optional[str] = None
     rerank_enabled: Optional[bool] = None
@@ -62,15 +70,31 @@ class RagTrace(BaseModel):
     rerank_error: Optional[str] = None
     retrieval_mode: Optional[str] = None
     candidate_k: Optional[int] = None
+    final_top_k: Optional[int] = None
+    two_stage_retrieval: Optional[bool] = None
+    doc_stage_top_n: Optional[int] = None
+    page_stage_top_n: Optional[int] = None
     leaf_retrieve_level: Optional[int] = None
     auto_merge_enabled: Optional[bool] = None
     auto_merge_applied: Optional[bool] = None
     auto_merge_threshold: Optional[int] = None
     auto_merge_replaced_chunks: Optional[int] = None
     auto_merge_steps: Optional[int] = None
+    page_merge_applied: Optional[bool] = None
+    merged_chunk_count: Optional[int] = None
+    final_context_chunk_count: Optional[int] = None
+    cover_page_filtered_count: Optional[int] = None
+    fallback_used: Optional[bool] = None
+    selected_docs: Optional[List[dict]] = None
+    selected_pages: Optional[List[dict]] = None
+    page_scores: Optional[List[dict]] = None
     retrieved_chunks: Optional[List[RetrievedChunk]] = None
     initial_retrieved_chunks: Optional[List[RetrievedChunk]] = None
     expanded_retrieved_chunks: Optional[List[RetrievedChunk]] = None
+    page_stage_candidates: Optional[List[RetrievedChunk]] = None
+    final_retrieved_chunks: Optional[List[RetrievedChunk]] = None
+    final_evidence_pack: Optional[List[RetrievedChunk]] = None
+    doc_stage_selected_docs: Optional[List[dict]] = None
 
 
 class ChatResponse(BaseModel):
@@ -152,6 +176,15 @@ class DocumentUploadJobResponse(BaseModel):
 class DocumentDeleteStartResponse(BaseModel):
     job_id: str
     filename: str
+    message: str
+
+
+class DocumentBatchDeleteRequest(BaseModel):
+    filenames: List[str]
+
+
+class DocumentBatchDeleteStartResponse(BaseModel):
+    jobs: List[DocumentDeleteStartResponse]
     message: str
 
 

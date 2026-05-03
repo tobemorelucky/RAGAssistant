@@ -1,0 +1,17 @@
+2026-04-30 Frontend batch upload debug fix
+
+Files changed:
+- frontend/index.html
+- frontend/script.js
+- frontend/style.css
+
+Summary:
+- Clarified the upload button text to explicitly say the picker supports multi-select.
+- Fixed the selected-files summary expression in the Vue template.
+- Added a short hint explaining that users can select multiple files at once or append more files in later picks.
+- Updated handleFileSelect() to merge newly chosen files into the existing pending list instead of replacing it.
+- Deduplicated appended files by name, size, and lastModified.
+- Reset the native file input after each selection so the same file can be chosen again if needed.
+
+Verification:
+- node --check frontend/script.js

@@ -1,0 +1,14 @@
+﻿[2026-05-02] Admin batch delete for vector documents
+
+Summary:
+- Added admin batch async delete endpoint for documents.
+- Reused existing per-file delete job pipeline and polling model.
+- Added frontend multi-select checkboxes and batch delete action in document management.
+- Kept single-document delete unchanged.
+
+Files:
+- backend/api.py
+- backend/schemas.py
+- frontend/index.html
+- frontend/script.js
+- frontend/style.css

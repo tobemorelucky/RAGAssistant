@@ -1,0 +1,18 @@
+﻿[2026-05-02] FinanceBench page-level index + hybrid page rerank + evidence pack
+
+Summary:
+- Added page-level storage at upload time: each page now stores doc_name, filename, page_number, page_text, table_text, and chunk_ids.
+- Kept stage-1 global chunk/doc retrieval, then switched stage-2 to page-level rerank inside selected docs.
+- Page rerank now blends dense_score, BM25/keyword_score, number/year overlap, metric keyword overlap, and initial chunk hit signal.
+- Built final LLM context as evidence pack entries with doc_name, filename, page_number, type, and text.
+- Extended rag_trace with selected_docs, selected_pages, page_scores, and final_evidence_pack.
+
+Files:
+- backend/document_loader.py
+- backend/document_page_store.py
+- backend/models.py
+- backend/api.py
+- backend/rag_utils.py
+- backend/rag_pipeline.py
+- backend/schemas.py
+- backend/tools.py

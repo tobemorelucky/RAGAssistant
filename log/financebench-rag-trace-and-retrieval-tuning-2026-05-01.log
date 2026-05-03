@@ -1,0 +1,59 @@
+时间：2026-05-01
+
+目标：
+1. 保留知识库中的干扰文档，不清空库。
+2. 为 FinanceBench 评估补充稳定、结构化的 `rag_trace`。
+3. 增加可配置检索参数。
+4. 默认支持关闭 step-back rewrite。
+5. 增加同页 / 相邻页 / 相邻 chunk 上下文合并。
+6. 增加检索诊断日志。
+
+本次修改：
+1. `backend/rag_utils.py`
+   - 新增 FinanceBench RAG 配置读取：
+     `FINANCE_RAG_CANDIDATE_K`
+     `FINANCE_RAG_FINAL_TOP_K`
+     `FINANCE_RAG_ENABLE_STEP_BACK`
+     `FINANCE_RAG_ENABLE_PAGE_MERGE`
+     `FINANCE_RAG_ADJACENT_PAGE_WINDOW`
+     `FINANCE_RAG_ADJACENT_CHUNK_WINDOW`
+   - 拆分为“候选召回”和“统一最终重排”两阶段：
+     - `retrieve_candidate_documents()`
+     - `finalize_retrieved_documents()`
+   - 当启用 rewrite 时，最终使用：
+     `initial_candidates + rewritten_candidates -> dedupe -> rerank -> final_top_k`
+   - 新增同页 / 相邻页 / 相邻 chunk 合并：
+     - `_merge_context_chunks()`
+   - 保留旧知识库，不删除干扰文档。
+2. `backend/rag_pipeline.py`
+   - 标准化 `rag_trace` 返回结构。
+   - 返回：
+     - `initial_retrieved_chunks`
+     - `expanded_retrieved_chunks`
+     - `final_retrieved_chunks`
+     - `retrieved_chunks`
+     - `rewrite_used`
+     - `rewrite_strategy`
+     - `original_question`
+     - `rewritten_question`
+     - `candidate_k`
+     - `final_top_k`
+     - `page_merge_applied`
+     - `merged_chunk_count`
+     - `final_context_chunk_count`
+   - 默认在 `FINANCE_RAG_ENABLE_STEP_BACK=false` 时跳过 step-back。
+   - 增加每次回答的检索诊断日志。
+3. `backend/schemas.py`
+   - 扩展 `RetrievedChunk` / `RagTrace` schema，支持新 trace 字段。
+4. `.env.example`
+   - 增加 FinanceBench RAG 相关环境变量示例。
+
+注意：
+1. 不修改生成模型、embedding 模型与接口协议。
+2. `chat_with_agent()` 仍然返回：
+   - `response`
+   - `rag_trace`
+3. `search_knowledge_base` 工具仍然把最终上下文块交给模型回答，但 trace 中会单独保留最终命中的 retrieved chunks。
+
+验证：
+1. `python -m py_compile backend/rag_utils.py backend/rag_pipeline.py backend/schemas.py`

@@ -1,0 +1,53 @@
+时间：2026-05-02
+
+目标：
+1. 保留知识库中的全部文档，不删除旧文件。
+2. 提升 FinanceBench 场景下 evidence page / evidence text 命中诊断能力。
+3. 增加简化版 doc -> page 两阶段检索。
+4. 稳定返回结构化 `rag_trace`，供 LangSmith evaluator 直接读取。
+
+本次修改：
+1. `backend/rag_utils.py`
+   - 增加 FinanceBench 两阶段检索配置：
+     - `FINANCE_RAG_TWO_STAGE_RETRIEVAL`
+     - `FINANCE_RAG_DOC_STAGE_TOP_N`
+     - `FINANCE_RAG_PAGE_STAGE_TOP_N`
+   - 第一阶段：全知识库召回 `candidate_k` 个小块。
+   - 第二阶段：
+     - 按 `filename/doc_name` 聚合候选块；
+     - 选出前 `DOC_STAGE_TOP_N` 个候选文档；
+     - 拉取这些文档内的 leaf chunks；
+     - 在文档内部做二次 rerank，保留 `PAGE_STAGE_TOP_N` 个 page/chunk 候选；
+     - 再得到最终 `final_top_k` 结果。
+   - 保留原有同页 / 相邻页 / 相邻 chunk small-to-big 扩展。
+2. `backend/rag_pipeline.py`
+   - `rag_trace` 现在稳定返回：
+     - `retrieved_chunks`
+     - `initial_retrieved_chunks`
+     - `expanded_retrieved_chunks`
+     - `page_stage_candidates`
+     - `final_retrieved_chunks`
+     - `doc_stage_selected_docs`
+     - `rewrite_used`
+     - `rewrite_strategy`
+     - `candidate_k`
+     - `final_top_k`
+     - `two_stage_retrieval`
+     - `page_merge_applied`
+     - `merged_chunk_count`
+     - `final_context_chunk_count`
+   - `retrieved_chunks` 现在优先表示最终送给模型的上下文 chunks。
+   - `final_retrieved_chunks` 表示 merge 前最终命中的核心块。
+3. `backend/schemas.py`
+   - 扩展 `RagTrace` schema，适配两阶段检索新增字段。
+4. `.env.example`
+   - 增加 FinanceBench 两阶段检索相关环境变量示例。
+
+说明：
+1. 默认仍支持 `FINANCE_RAG_ENABLE_STEP_BACK=false`，此时不做 step-back 泛化改写。
+2. 若以后开启 rewrite，也不会替代 initial retrieval，而是走：
+   `initial candidates + rewritten candidates -> dedupe -> final rerank`
+3. 不修改 embedding 模型、生成模型、前端样式、接口主字段。
+
+验证：
+1. `python -m py_compile backend/rag_utils.py backend/rag_pipeline.py backend/schemas.py`

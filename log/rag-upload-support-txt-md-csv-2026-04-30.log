@@ -1,0 +1,25 @@
+2026-04-30 RAG upload support for txt md csv
+
+Files changed:
+- backend/document_loader.py
+- backend/api.py
+- frontend/index.html
+- frontend/script.js
+
+Summary:
+- Added .txt support through TextLoader with autodetect_encoding enabled.
+- Added .md support through TextLoader with autodetect_encoding enabled.
+- Added .csv support through CSVLoader with autodetect_encoding enabled.
+- Unified loader selection in DocumentLoader via _resolve_doc_type_and_loader().
+- Added _resolve_page_number() so plain text and markdown default to page 1, and CSV rows map to stable row-based page numbers.
+- Extended backend upload allowlist to accept .txt .md .csv.
+- Extended frontend file input accept list to include .txt .md .csv.
+- Added file icons for Text, Markdown, and CSV in the document list UI.
+
+Verification:
+- python -m py_compile backend/document_loader.py backend/api.py
+- Smoke-tested loader output with sample.txt sample.md sample.csv
+- Smoke test result:
+  sample.txt 3 ['Text'] [1]
+  sample.md 3 ['Markdown'] [1]
+  sample.csv 6 ['CSV'] [1, 2]

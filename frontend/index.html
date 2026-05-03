@@ -77,7 +77,7 @@
             <div v-if="isAuthenticated && activeNav === 'settings'" class="settings-panel">
                 <div class="settings-header">
                     <h2><i class="fas fa-cog"></i> 文档管理</h2>
-                    <p>上传文档进行向量化处理，支持 PDF 和 Word 、Excel 格式</p>
+                    <p>上传文档进行向量化处理，支持 PDF、Word、Excel、TXT、Markdown、CSV 格式，可批量上传</p>
                 </div>
 
                 <div class="upload-section">
@@ -87,16 +87,19 @@
                             type="file" 
                             ref="fileInput" 
                             @change="handleFileSelect"
-                            accept=".pdf,.doc,.docx,.xls,.xlsx"
+                            accept=".pdf,.doc,.docx,.xls,.xlsx,.txt,.md,.csv"
+                            multiple
                             style="display: none"
                         />
                         <button @click="$refs.fileInput.click()" class="upload-btn">
-                            <i class="fas fa-cloud-upload-alt"></i> 选择文件
+                            <i class="fas fa-cloud-upload-alt"></i> 选择文件（可多选）
                         </button>
-                        <div v-if="selectedFile" class="selected-file">
-                            <i class="fas fa-file"></i> {{ selectedFile.name }}
-                            <button @click="uploadDocument" class="btn-primary" :disabled="isUploading">
-                                <i class="fas fa-upload"></i> {{ isUploading ? '上传中...' : '开始上传' }}
+                        <p class="upload-tip">支持一次多选，也支持分多次选择并追加到当前待上传列表。</p>
+                        <div v-if="selectedFiles.length" class="selected-file">
+                            <i class="fas fa-file"></i>
+                            {{ selectedFiles.length === 1 ? selectedFiles[0].name : ('已选择 ' + selectedFiles.length + ' 个文件') }}
+                            <button @click="uploadSelectedFiles" class="btn-primary" :disabled="isUploading">
+                                <i class="fas fa-upload"></i> {{ isUploading ? '上传中...' : '批量上传' }}
                             </button>
                         </div>
                         <div v-if="uploadSteps.length" class="upload-progress" :class="{ collapsed: uploadProgressCollapsed }">
@@ -127,6 +130,16 @@
                 </div>
 
                 <div class="documents-section">
+                    <div class="document-actions">
+                        <button @click="toggleAllDocumentsSelection" class="btn-secondary" :disabled="documents.length === 0">
+                            <i class="fas fa-check-square"></i>
+                            {{ allSelectableDocumentsSelected ? '鍙栨秷鍏ㄩ€?' : '鍏ㄩ€?' }}
+                        </button>
+                        <button @click="deleteSelectedDocuments" class="btn-danger" :disabled="selectedDocumentCount === 0">
+                            <i class="fas fa-trash"></i> 鎵归噺鍒犻櫎
+                            <span v-if="selectedDocumentCount > 0">({{ selectedDocumentCount }})</span>
+                        </button>
+                    </div>
                     <h3><i class="fas fa-list"></i> 已上传文档</h3>
                     <button @click="loadDocuments" class="btn-secondary">
                         <i class="fas fa-sync"></i> 刷新列表
@@ -150,6 +163,14 @@
                         >
                             <div class="document-main">
                                 <div class="document-row">
+                                    <label class="document-select">
+                                        <input
+                                            type="checkbox"
+                                            :checked="isDocumentSelected(doc.filename)"
+                                            :disabled="isDeleteActionLocked(doc.filename)"
+                                            @change="toggleDocumentSelection(doc.filename)"
+                                        />
+                                    </label>
                                     <div class="document-info">
                                         <div class="document-icon">
                                             <i :class="getFileIcon(doc.file_type)"></i>

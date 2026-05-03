@@ -1,0 +1,13 @@
+﻿[2026-05-02] FinanceBench two-stage retrieval / page merge hotfix
+
+Summary:
+- Fixed two-stage retrieval so stage 2 re-searches inside selected docs with the original query instead of scanning all doc-start chunks.
+- Added fallback blending: initial reranked chunks + page-stage candidates + merge-window chunks, then unified rerank.
+- Added cover/TOC filtering heuristics to suppress page 0 / SEC cover / table of contents chunks for normal FinanceBench questions.
+- Prevented auto-merge from collapsing final retrieved chunks far below FINANCE_RAG_FINAL_TOP_K when enough leaf chunks exist.
+- Extended rag_trace and diagnostics with cover_page_filtered_count, fallback_used, final chunk count, and page-number distribution.
+
+Files:
+- backend/rag_utils.py
+- backend/rag_pipeline.py
+- backend/schemas.py

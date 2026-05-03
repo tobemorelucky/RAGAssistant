@@ -1,0 +1,44 @@
+时间：2026-05-01
+
+问题：
+1. FinanceBench 提高 `candidate_k` 后，Milvus hybrid_search 报错：
+   `ef(64) should be larger than k(100)`
+2. 根因是 Milvus HNSW 搜索参数中的 `ef` 被写死为 `64`，但实际 Dense AnnSearchRequest 的
+   `limit/search_k` 已经被提升到了 `100`。
+
+本次修改：
+1. `backend/milvus_client.py`
+   - 新增环境变量配置：`MILVUS_SEARCH_EF`，默认值 `128`。
+   - 新增 `_resolve_effective_ef(search_k)`：
+     - 规则：`effective_ef = max(configured_ef, search_k * 2)`
+     - 并兜底保证：`effective_ef > search_k`
+   - 将 `hybrid_retrieve()` 中 Dense `AnnSearchRequest` 的 `ef` 从写死 `64` 改为动态计算值。
+   - 将 `dense_retrieve()` 中 `search_params.params.ef` 从写死 `64` 改为动态计算值。
+   - 增加日志：
+     - `candidate_k`
+     - `final_top_k`
+     - `actual_search_k`
+     - `final_limit`
+     - `configured_ef`
+     - `effective_ef`
+     - `metric_type`
+     - `collection`
+   - 如果发生自动修正，会记录：
+     `Milvus HNSW ef auto-adjusted from X to Y because search_k=Z`
+2. `backend/rag_utils.py`
+   - 增加检索调试日志，记录当前 `candidate_k` 与 `final_top_k`。
+3. `.env.example`
+   - 增加 `MILVUS_SEARCH_EF=128` 示例配置。
+
+search_k 说明：
+1. `hybrid_retrieve(top_k)` 内部实际给 Dense / Sparse `AnnSearchRequest` 使用的是：
+   `actual_search_k = top_k * 2`
+2. `dense_retrieve(top_k)` 内部实际搜索数量是：
+   `actual_search_k = top_k`
+3. 因此在 FinanceBench 配置下：
+   - `candidate_k = 50`
+   - hybrid Dense request 的 `actual_search_k = 100`
+   - 此时 `effective_ef` 至少会被调到大于 `100`
+
+验证：
+1. `python -m py_compile backend/milvus_client.py backend/rag_utils.py`

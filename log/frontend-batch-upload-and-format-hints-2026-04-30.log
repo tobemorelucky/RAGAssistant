@@ -1,0 +1,19 @@
+2026-04-30 Frontend batch upload and format hints
+
+Files changed:
+- frontend/index.html
+- frontend/script.js
+- backend/api.py
+
+Summary:
+- Updated the document management hint text to explicitly list PDF, Word, Excel, TXT, Markdown, and CSV.
+- Enabled multi-select on the upload file input.
+- Changed the selected file display from a single file name to a batch-aware summary.
+- Added uploadSelectedFiles() to upload multiple selected files sequentially.
+- Reused the existing async upload job endpoint and per-file polling flow for reliability.
+- Added resetSelectedFiles() and waitForUploadJob() helpers for batch upload cleanup and polling.
+- Updated backend validation messages to mention TXT, Markdown, and CSV.
+
+Verification:
+- python -m py_compile backend/document_loader.py backend/api.py
+- node --check frontend/script.js

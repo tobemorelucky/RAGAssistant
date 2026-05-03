@@ -1,8 +1,4 @@
-"""上传任务进度管理。
-
-轻量版先使用进程内存保存任务状态，适合当前单进程开发部署。
-如果后续要支持多进程或服务重启恢复，可以把同样的数据结构迁移到 Redis/PostgreSQL。
-"""
+"""In-memory upload/delete job tracking."""
 from __future__ import annotations
 
 from copy import deepcopy
@@ -17,18 +13,18 @@ JobStatus = Literal["pending", "running", "completed", "failed"]
 
 
 DEFAULT_STEPS = [
-    ("upload", "文档上传"),
-    ("cleanup", "清理旧版本"),
-    ("parse", "解析与分块"),
-    ("parent_store", "父级分块入库"),
-    ("vector_store", "向量化入库"),
+    ("upload", "上传文件"),
+    ("cleanup", "清理旧数据"),
+    ("parse", "解析文档"),
+    ("parent_store", "写入父块存储"),
+    ("vector_store", "写入向量库"),
 ]
 
 DELETE_STEPS = [
     ("prepare", "准备删除"),
-    ("bm25", "同步 BM25 统计"),
-    ("milvus", "删除向量数据"),
-    ("parent_store", "删除父级分块"),
+    ("bm25", "清理 BM25 统计"),
+    ("milvus", "删除向量库数据"),
+    ("parent_store", "删除父块存储"),
 ]
 
 
@@ -37,7 +33,7 @@ def _now_iso() -> str:
 
 
 class UploadJobManager:
-    """线程安全的上传任务状态容器。"""
+    """Tracks upload/delete jobs for the frontend progress UI."""
 
     def __init__(self):
         self._jobs: dict[str, dict] = {}
@@ -49,7 +45,7 @@ class UploadJobManager:
         *,
         steps: list[tuple[str, str]] | None = None,
         current_step: str = "upload",
-        message: str = "等待上传",
+        message: str = "等待处理",
         completion_step: str = "vector_store",
     ) -> dict:
         steps = steps or DEFAULT_STEPS
@@ -61,7 +57,6 @@ class UploadJobManager:
             "status": "pending",
             "current_step": current_step,
             "message": message,
-            # 完成节点用于区分上传和删除，避免 complete_job 写死最后一步。
             "completion_step": completion_step,
             "total_chunks": 0,
             "processed_chunks": 0,
@@ -127,7 +122,7 @@ class UploadJobManager:
     def complete_step(self, job_id: str, step_key: str, message: str = "") -> dict | None:
         return self.update_step(job_id, step_key, 100, "completed", message)
 
-    def complete_job(self, job_id: str, message: str = "文档入库完成") -> dict | None:
+    def complete_job(self, job_id: str, message: str = "处理完成") -> dict | None:
         with self._lock:
             job = self._jobs.get(job_id)
             if not job:

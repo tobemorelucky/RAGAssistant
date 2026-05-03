@@ -1,4 +1,4 @@
-const { createApp } = Vue;
+﻿const { createApp } = Vue;
 
 createApp({
     data() {
@@ -14,7 +14,7 @@ createApp({
             isComposing: false,
             documents: [],
             documentsLoading: false,
-            selectedFile: null,
+            selectedFiles: [],
             isUploading: false,
             uploadProgress: '',
             uploadSteps: [],
@@ -24,6 +24,7 @@ createApp({
             deleteJobs: {},
             deletePollTimers: {},
             deleteRemoveTimers: {},
+            selectedDocumentFilenames: [],
             token: localStorage.getItem('accessToken') || '',
             currentUser: null,
             authMode: 'login',
@@ -42,6 +43,13 @@ createApp({
         },
         isAdmin() {
             return this.currentUser?.role === 'admin';
+        },
+        selectedDocumentCount() {
+            return this.selectedDocumentFilenames.length;
+        },
+        allSelectableDocumentsSelected() {
+            const selectable = this.documents.filter(doc => !this.isDeleteActionLocked(doc.filename));
+            return selectable.length > 0 && selectable.every(doc => this.selectedDocumentFilenames.includes(doc.filename));
         }
     },
     async mounted() {
@@ -104,7 +112,7 @@ createApp({
         async fetchMe() {
             const response = await this.authFetch('/auth/me');
             if (!response.ok) {
-                throw new Error('认证失败');
+                throw new Error('璁よ瘉澶辫触');
             }
             this.currentUser = await response.json();
         },
@@ -114,7 +122,7 @@ createApp({
             const username = this.authForm.username.trim();
             const password = this.authForm.password.trim();
             if (!username || !password) {
-                alert('用户名和密码不能为空');
+                alert('鐢ㄦ埛鍚嶅拰瀵嗙爜涓嶈兘涓虹┖');
                 return;
             }
 
@@ -138,7 +146,7 @@ createApp({
 
                 const data = await response.json().catch(() => ({}));
                 if (!response.ok) {
-                    throw new Error(data.detail || '认证失败');
+                    throw new Error(data.detail || '璁よ瘉澶辫触');
                 }
 
                 this.token = data.access_token;
@@ -162,6 +170,7 @@ createApp({
             this.messages = [];
             this.sessions = [];
             this.documents = [];
+            this.selectedDocumentFilenames = [];
             this.activeNav = 'newChat';
             this.showHistorySidebar = false;
             localStorage.removeItem('accessToken');
@@ -190,7 +199,7 @@ createApp({
 
         async handleSend() {
             if (!this.isAuthenticated) {
-                alert('请先登录');
+                alert('璇峰厛鐧诲綍');
                 return;
             }
 
@@ -281,13 +290,13 @@ createApp({
                 if (error.name === 'AbortError') {
                     this.messages[botMsgIdx].isThinking = false;
                     if (!this.messages[botMsgIdx].text) {
-                        this.messages[botMsgIdx].text = '(已终止回答)';
+                        this.messages[botMsgIdx].text = '(宸茬粓姝㈠洖绛?';
                     } else {
-                        this.messages[botMsgIdx].text += '\n\n_(回答已被终止)_';
+                        this.messages[botMsgIdx].text += '\n\n_(鍥炵瓟宸茶缁堟)_';
                     }
                 } else {
                     this.messages[botMsgIdx].isThinking = false;
-                    this.messages[botMsgIdx].text = `喵呜... 出了点问题：${error.message}`;
+                    this.messages[botMsgIdx].text = `鍠靛憸... 鍑轰簡鐐归棶棰橈細${error.message}`;
                 }
             } finally {
                 this.isLoading = false;
@@ -323,7 +332,7 @@ createApp({
         },
 
         handleClearChat() {
-            if (confirm('确定要清空当前对话吗？喵？')) {
+            if (confirm('确定要清空当前对话吗？')) {
                 this.messages = [];
             }
         },
@@ -371,7 +380,7 @@ createApp({
         },
 
         async deleteSession(sessionId) {
-            if (!confirm(`确定要删除会话 "${sessionId}" 吗？`)) {
+            if (!confirm(`纭畾瑕佸垹闄や細璇?"${sessionId}" 鍚楋紵`)) {
                 return;
             }
 
@@ -427,6 +436,11 @@ createApp({
             return merged;
         },
 
+        pruneSelectedDocuments() {
+            const available = new Set(this.documents.map(doc => doc.filename));
+            this.selectedDocumentFilenames = this.selectedDocumentFilenames.filter(filename => available.has(filename));
+        },
+
         async loadDocuments() {
             this.documentsLoading = true;
             try {
@@ -437,6 +451,7 @@ createApp({
                 }
                 const data = await response.json();
                 this.documents = this.mergeDocumentsWithActiveDeletes(data.documents);
+                this.pruneSelectedDocuments();
             } catch (error) {
                 alert('加载文档列表失败：' + error.message);
             } finally {
@@ -444,23 +459,62 @@ createApp({
             }
         },
 
+        isDocumentSelected(filename) {
+            return this.selectedDocumentFilenames.includes(filename);
+        },
+
+        toggleDocumentSelection(filename) {
+            if (this.isDeleteActionLocked(filename)) return;
+            if (this.isDocumentSelected(filename)) {
+                this.selectedDocumentFilenames = this.selectedDocumentFilenames.filter(item => item !== filename);
+            } else {
+                this.selectedDocumentFilenames = [...this.selectedDocumentFilenames, filename];
+            }
+        },
+
+        toggleAllDocumentsSelection() {
+            const selectable = this.documents
+                .filter(doc => !this.isDeleteActionLocked(doc.filename))
+                .map(doc => doc.filename);
+            if (!selectable.length) {
+                this.selectedDocumentFilenames = [];
+                return;
+            }
+            this.selectedDocumentFilenames = this.allSelectableDocumentsSelected ? [] : selectable;
+        },
+
         handleFileSelect(event) {
             const files = event.target.files;
             if (files && files.length > 0) {
-                this.selectedFile = files[0];
+                const nextFiles = Array.from(files);
+                const merged = [...this.selectedFiles];
+                for (const file of nextFiles) {
+                    const exists = merged.some(item =>
+                        item.name === file.name &&
+                        item.size === file.size &&
+                        item.lastModified === file.lastModified
+                    );
+                    if (!exists) {
+                        merged.push(file);
+                    }
+                }
+                this.selectedFiles = merged;
                 this.uploadProgress = '';
                 this.uploadSteps = this.createUploadSteps();
                 this.uploadProgressCollapsed = false;
                 this.activeUploadJobId = '';
+                if (this.$refs.fileInput) {
+                    this.$refs.fileInput.value = '';
+                }
             }
         },
 
         createUploadSteps() {
             return [
-                { key: 'upload', label: '文档上传', percent: 0, status: 'pending', message: '' },
+                { key: 'upload', label: '鏂囨。涓婁紶', percent: 0, status: 'pending', message: '' },
                 { key: 'cleanup', label: '清理旧版本', percent: 0, status: 'pending', message: '' },
                 { key: 'parse', label: '解析与分块', percent: 0, status: 'pending', message: '' },
-                { key: 'parent_store', label: '父级分块入库', percent: 0, status: 'pending', message: '' },
+                { key: 'parent_store', label: '鐖剁骇鍒嗗潡鍏ュ簱', percent: 0, status: 'pending', message: '' },
                 { key: 'vector_store', label: '向量化入库', percent: 0, status: 'pending', message: '' },
             ];
         },
@@ -492,7 +546,7 @@ createApp({
                 xhr.upload.onprogress = (event) => {
                     if (!event.lengthComputable) return;
                     const percent = Math.round((event.loaded / event.total) * 100);
-                    this.updateUploadStep('upload', percent, 'running', `已上传 ${percent}%`);
+                    this.updateUploadStep('upload', percent, 'running', `宸蹭笂浼?${percent}%`);
                 };
 
                 xhr.onload = () => {
@@ -506,7 +560,7 @@ createApp({
                     try {
                         data = JSON.parse(xhr.responseText || '{}');
                     } catch (e) {
-                        reject(new Error('上传响应解析失败'));
+                        reject(new Error('涓婁紶鍝嶅簲瑙ｆ瀽澶辫触'));
                         return;
                     }
 
@@ -515,11 +569,11 @@ createApp({
                         return;
                     }
 
-                    this.updateUploadStep('upload', 100, 'completed', '文档上传完成');
+                    this.updateUploadStep('upload', 100, 'completed', '鏂囨。涓婁紶瀹屾垚');
                     resolve(data);
                 };
 
-                xhr.onerror = () => reject(new Error('上传请求失败'));
+                xhr.onerror = () => reject(new Error('涓婁紶璇锋眰澶辫触'));
                 xhr.onabort = () => reject(new Error('上传已取消'));
                 xhr.send(formData);
             });
@@ -537,7 +591,7 @@ createApp({
                     message: step.message || ''
                 }));
             }
-            // 入库成功后自动收起步骤明细，保留摘要供用户再次展开查看。
+            // 鍏ュ簱鎴愬姛鍚庤嚜鍔ㄦ敹璧锋楠ゆ槑缁嗭紝淇濈暀鎽樿渚涚敤鎴峰啀娆″睍寮€鏌ョ湅銆?
             if (job.status === 'completed') {
                 this.uploadProgressCollapsed = true;
             }
@@ -551,6 +605,87 @@ createApp({
             if (this.uploadPollTimer) {
                 clearInterval(this.uploadPollTimer);
                 this.uploadPollTimer = null;
+            }
+        },
+
+        resetSelectedFiles() {
+            this.selectedFiles = [];
+            if (this.$refs.fileInput) {
+                this.$refs.fileInput.value = '';
+            }
+        },
+
+        sleep(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+        },
+
+        async waitForUploadJob(jobId, fileName, index, total) {
+            while (true) {
+                const response = await this.authFetch(`/documents/upload/jobs/${encodeURIComponent(jobId)}`);
+                if (!response.ok) {
+                    const error = await response.json().catch(() => ({}));
+                    throw new Error(error.detail || 'Failed to load upload job');
+                }
+
+                const job = await response.json();
+                this.syncUploadJob(job);
+                this.uploadProgress = `(${index}/${total}) ${fileName}: ${job.message || ''}`;
+
+                if (job.status === 'completed') {
+                    this.uploadProgressCollapsed = true;
+                    return job;
+                }
+                if (job.status === 'failed') {
+                    throw new Error(job.error || job.message || 'Upload job failed');
+                }
+
+                await this.sleep(1000);
+            }
+        },
+
+        async uploadSelectedFiles() {
+            if (!this.selectedFiles.length) {
+                alert('璇峰厛閫夋嫨鏂囦欢');
+                return;
+            }
+
+            this.isUploading = true;
+            this.uploadProgressCollapsed = false;
+
+            const total = this.selectedFiles.length;
+            const successFiles = [];
+            const failedFiles = [];
+
+            try {
+                for (let index = 0; index < total; index += 1) {
+                    const file = this.selectedFiles[index];
+                    this.uploadSteps = this.createUploadSteps();
+                    this.activeUploadJobId = '';
+                    this.uploadProgress = `(${index + 1}/${total}) 姝ｅ湪涓婁紶 ${file.name}`;
+                    this.updateUploadStep('upload', 0, 'running', `鍑嗗涓婁紶 ${file.name}`);
+
+                    try {
+                        const data = await this.uploadFileWithProgress(file);
+                        this.activeUploadJobId = data.job_id;
+                        await this.waitForUploadJob(data.job_id, file.name, index + 1, total);
+                        successFiles.push(file.name);
+                    } catch (error) {
+                        failedFiles.push(`${file.name}: ${error.message}`);
+                        this.updateUploadStep('upload', 100, 'failed', error.message);
+                    }
+                }
+
+                await this.loadDocuments();
+
+                if (failedFiles.length === 0) {
+                    this.uploadProgress = '批量上传完成，共 ' + successFiles.length + ' 个文件';
+                } else {
+                    this.uploadProgress = '批量上传完成，成功 ' + successFiles.length + ' 个，失败 ' + failedFiles.length + ' 个';
+                    alert('部分文件上传失败：\\n' + failedFiles.join('\\n'));
+                }
+            } finally {
+                this.isUploading = false;
+                this.resetSelectedFiles();
             }
         },
 
@@ -571,10 +706,7 @@ createApp({
                     if (job.status === 'completed') {
                         this.stopUploadJobPolling();
                         this.isUploading = false;
-                        this.selectedFile = null;
-                        if (this.$refs.fileInput) {
-                            this.$refs.fileInput.value = '';
-                        }
+                        this.resetSelectedFiles();
                         await this.loadDocuments();
                     } else if (job.status === 'failed') {
                         this.stopUploadJobPolling();
@@ -592,19 +724,19 @@ createApp({
         },
 
         async uploadDocument() {
-            if (!this.selectedFile) {
-                alert('请先选择文件');
+            if (!this.selectedFiles.length) {
+                alert('璇峰厛閫夋嫨鏂囦欢');
                 return;
             }
 
             this.isUploading = true;
-            this.uploadProgress = '正在上传...';
+            this.uploadProgress = '姝ｅ湪涓婁紶...';
             this.uploadSteps = this.createUploadSteps();
             this.uploadProgressCollapsed = false;
-            this.updateUploadStep('upload', 0, 'running', '准备上传');
+            this.updateUploadStep('upload', 0, 'running', '鍑嗗涓婁紶');
 
             try {
-                const data = await this.uploadFileWithProgress(this.selectedFile);
+                const data = await this.uploadFileWithProgress(this.selectedFiles[0]);
                 this.uploadProgress = data.message;
                 this.activeUploadJobId = data.job_id;
                 this.startUploadJobPolling(data.job_id);
@@ -617,10 +749,10 @@ createApp({
 
         createDeleteSteps() {
             return [
-                { key: 'prepare', label: '准备删除', percent: 0, status: 'pending', message: '' },
-                { key: 'bm25', label: '同步 BM25 统计', percent: 0, status: 'pending', message: '' },
-                { key: 'milvus', label: '删除向量数据', percent: 0, status: 'pending', message: '' },
-                { key: 'parent_store', label: '删除父级分块', percent: 0, status: 'pending', message: '' },
+                { key: 'prepare', label: '鍑嗗鍒犻櫎', percent: 0, status: 'pending', message: '' },
+                { key: 'bm25', label: '鍚屾 BM25 缁熻', percent: 0, status: 'pending', message: '' },
+                { key: 'milvus', label: '鍒犻櫎鍚戦噺鏁版嵁', percent: 0, status: 'pending', message: '' },
+                { key: 'parent_store', label: '鍒犻櫎鐖剁骇鍒嗗潡', percent: 0, status: 'pending', message: '' },
             ];
         },
 
@@ -653,7 +785,7 @@ createApp({
 
         syncDeleteJob(filename, job) {
             const current = this.deleteJobs[filename] || {};
-            // 后端返回统一的步骤结构，前端只负责同步到当前文档行内卡片。
+            // 鍚庣杩斿洖缁熶竴鐨勬楠ょ粨鏋勶紝鍓嶇鍙礋璐ｅ悓姝ュ埌褰撳墠鏂囨。琛屽唴鍗＄墖銆?
             this.setDeleteJob(filename, {
                 jobId: job.job_id,
                 status: job.status,
@@ -697,9 +829,10 @@ createApp({
 
         scheduleDeletedDocumentRemoval(filename) {
             this.clearDeleteRemovalTimer(filename);
-            // 删除完成后先保留 3 秒摘要，再从当前列表移除并刷新后端状态。
+            // 鍒犻櫎瀹屾垚鍚庡厛淇濈暀 3 绉掓憳瑕侊紝鍐嶄粠褰撳墠鍒楄〃绉婚櫎骞跺埛鏂板悗绔姸鎬併€?
             const timer = setTimeout(async () => {
                 this.documents = this.documents.filter(doc => doc.filename !== filename);
+                this.selectedDocumentFilenames = this.selectedDocumentFilenames.filter(item => item !== filename);
                 const { [filename]: _job, ...jobs } = this.deleteJobs;
                 const { [filename]: _timer, ...timers } = this.deleteRemoveTimers;
                 this.deleteJobs = jobs;
@@ -749,12 +882,70 @@ createApp({
                 [filename]: setInterval(poll, 1000)
             };
         },
+        async deleteSelectedDocuments() {
+            const filenames = this.selectedDocumentFilenames.filter(filename => !this.isDeleteActionLocked(filename));
+            if (!filenames.length) {
+                alert('请先选择要删除的文档');
+                return;
+            }
+            if (!confirm('确定要批量删除 ' + filenames.length + ' 个文档吗？这将同时删除 Milvus 中的相关向量数据。')) {
+                return;
+            }
+
+            filenames.forEach(filename => {
+                this.clearDeleteRemovalTimer(filename);
+                this.setDeleteJob(filename, {
+                    status: 'running',
+                    message: '正在提交批量删除任务...',
+                    collapsed: false,
+                    steps: this.createDeleteSteps().map(step => (
+                        step.key === 'prepare'
+                            ? { ...step, percent: 1, status: 'running', message: '正在提交删除任务' }
+                            : step
+                    ))
+                });
+            });
+
+            try {
+                const response = await this.authFetch('/documents/delete/async/batch', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ filenames })
+                });
+
+                if (!response.ok) {
+                    const error = await response.json().catch(() => ({}));
+                    throw new Error(error.detail || 'Batch delete failed');
+                }
+
+                const data = await response.json();
+                (data.jobs || []).forEach(job => {
+                    this.setDeleteJob(job.filename, {
+                        jobId: job.job_id,
+                        status: 'running',
+                        message: job.message || ('正在删除 ' + job.filename),
+                        collapsed: false
+                    });
+                    this.startDeleteJobPolling(job.filename, job.job_id);
+                });
+                this.selectedDocumentFilenames = [];
+            } catch (error) {
+                filenames.forEach(filename => {
+                    this.setDeleteJob(filename, {
+                        status: 'failed',
+                        message: '批量删除失败：' + error.message,
+                        collapsed: false,
+                        steps: this.deleteJobs[filename]?.steps || this.createDeleteSteps()
+                    });
+                });
+            }
+        },
 
         async deleteDocument(filename) {
             if (this.isDeletingDocument(filename)) {
                 return;
             }
-            if (!confirm(`确定要删除文档 "${filename}" 吗？这将同时删除 Milvus 中的所有相关向量。`)) {
+            if (!confirm('确定要删除文档 "' + filename + '" 吗？这将同时删除 Milvus 中的所有相关向量。')) {
                 return;
             }
 
@@ -784,7 +975,7 @@ createApp({
                 this.setDeleteJob(filename, {
                     jobId: data.job_id,
                     status: 'running',
-                    message: data.message || `正在删除 ${filename}`,
+                    message: data.message || `姝ｅ湪鍒犻櫎 ${filename}`,
                     collapsed: false
                 });
                 this.startDeleteJobPolling(filename, data.job_id);
@@ -806,6 +997,12 @@ createApp({
                 return 'fas fa-file-word';
             } else if (fileType === 'Excel') {
                 return 'fas fa-file-excel';
+            } else if (fileType === 'Text') {
+                return 'fas fa-file-lines';
+            } else if (fileType === 'Markdown') {
+                return 'fab fa-markdown';
+            } else if (fileType === 'CSV') {
+                return 'fas fa-file-csv';
             }
             return 'fas fa-file';
         }
@@ -821,3 +1018,4 @@ createApp({
         }
     }
 }).mount('#app');
+

@@ -1,0 +1,22 @@
+2026-05-01 RAG text sanitize for NUL and control characters
+
+Files changed:
+- backend/text_sanitizer.py
+- backend/document_loader.py
+- backend/parent_chunk_store.py
+- backend/milvus_writer.py
+
+Summary:
+- Added a shared sanitize_text() helper.
+- Removed NUL (\x00) characters.
+- Removed unsafe control characters in the ranges U+0000-U+001F and U+007F-U+009F.
+- Preserved newline, carriage return, and tab.
+- Applied sanitization:
+  - after document parsing and before chunk splitting
+  - after each split level generates chunk text
+  - before writing parent chunks into PostgreSQL/Redis
+  - before generating embeddings and inserting documents into Milvus
+
+Verification:
+- python -m py_compile backend/text_sanitizer.py backend/document_loader.py backend/parent_chunk_store.py backend/milvus_writer.py
+- Smoke test with a txt file containing NUL and other control characters

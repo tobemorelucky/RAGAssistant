@@ -1,4 +1,5 @@
 """Milvus 客户端 - 支持密集向量+稀疏向量混合检索"""
+import logging
 import os
 import threading
 from typing import Callable, TypeVar
@@ -11,6 +12,7 @@ load_dotenv()
 # Milvus 单次 query 的 limit 上限（超出会报 invalid max query result window）
 QUERY_MAX_LIMIT = 16384
 T = TypeVar("T")
+logger = logging.getLogger(__name__)
 
 
 class MilvusManager:
@@ -20,9 +22,52 @@ class MilvusManager:
         self.host = os.getenv("MILVUS_HOST", "localhost")
         self.port = os.getenv("MILVUS_PORT", "19530")
         self.collection_name = os.getenv("MILVUS_COLLECTION", "embeddings_collection")
+        self.configured_search_ef = max(1, int(os.getenv("MILVUS_SEARCH_EF", "128")))
         self.uri = f"http://{self.host}:{self.port}"
         self.client = None
         self._client_lock = threading.RLock()
+
+    def _resolve_effective_ef(self, search_k: int) -> int:
+        search_k = max(1, int(search_k))
+        effective_ef = max(self.configured_search_ef, search_k * 2)
+        if effective_ef <= search_k:
+            effective_ef = search_k + 1
+        if effective_ef != self.configured_search_ef:
+            logger.info(
+                "Milvus HNSW ef auto-adjusted from %s to %s because search_k=%s",
+                self.configured_search_ef,
+                effective_ef,
+                search_k,
+            )
+        return effective_ef
+
+    def _log_search_params(
+        self,
+        *,
+        retrieval_type: str,
+        candidate_k: int | None,
+        final_top_k: int | None,
+        actual_search_k: int,
+        final_limit: int,
+        metric_type: str,
+        effective_ef: int,
+    ) -> None:
+        logger.info(
+            (
+                "Milvus search params retrieval_type=%s collection=%s metric_type=%s "
+                "candidate_k=%s final_top_k=%s actual_search_k=%s final_limit=%s "
+                "configured_ef=%s effective_ef=%s"
+            ),
+            retrieval_type,
+            self.collection_name,
+            metric_type,
+            candidate_k,
+            final_top_k,
+            actual_search_k,
+            final_limit,
+            self.configured_search_ef,
+            effective_ef,
+        )
 
     def _get_client(self) -> MilvusClient:
         # Lazy-create client to avoid blocking app import/startup when Milvus is temporarily unavailable.
@@ -151,27 +196,44 @@ class MilvusManager:
         )
 
     def query_all(self, filter_expr: str = "", output_fields: list[str] | None = None) -> list:
-        """分页拉取匹配 filter 的全部行，避免单次 limit 超过服务端窗口。"""
+        """流式拉取匹配 filter 的全部行，避免 offset+limit 撞上 Milvus 查询窗口上限。"""
         fields = output_fields or ["filename", "file_type"]
-        out: list = []
-        offset = 0
-        while True:
-            batch = self._run_with_reconnect(
-                lambda client: client.query(
+        batch_size = min(1000, QUERY_MAX_LIMIT)
+
+        def _query_all(client: MilvusClient) -> list:
+            if not hasattr(client, "query_iterator"):
+                return client.query(
                     collection_name=self.collection_name,
                     filter=filter_expr,
                     output_fields=fields,
                     limit=QUERY_MAX_LIMIT,
-                    offset=offset,
                 )
+
+            iterator = client.query_iterator(
+                collection_name=self.collection_name,
+                batch_size=batch_size,
+                limit=-1,
+                filter=filter_expr,
+                output_fields=fields,
             )
-            if not batch:
-                break
-            out.extend(batch)
-            if len(batch) < QUERY_MAX_LIMIT:
-                break
-            offset += len(batch)
-        return out
+
+            out: list = []
+            try:
+                while True:
+                    batch = iterator.next()
+                    if not batch:
+                        break
+                    out.extend(batch)
+                return out
+            finally:
+                close = getattr(iterator, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+
+        return self._run_with_reconnect(_query_all)
 
     def get_chunks_by_ids(self, chunk_ids: list[str]) -> list[dict]:
         """根据 chunk_id 批量查询分块（用于 Auto-merging 拉取父块）"""
@@ -224,13 +286,24 @@ class MilvusManager:
             "chunk_level",
             "chunk_idx",
         ]
+        actual_search_k = max(1, top_k * 2)
+        effective_ef = self._resolve_effective_ef(actual_search_k)
+        self._log_search_params(
+            retrieval_type="hybrid",
+            candidate_k=top_k,
+            final_top_k=top_k,
+            actual_search_k=actual_search_k,
+            final_limit=top_k,
+            metric_type="IP",
+            effective_ef=effective_ef,
+        )
         
         # 密集向量搜索请求
         dense_search = AnnSearchRequest(
             data=[dense_embedding],
             anns_field="dense_embedding",
-            param={"metric_type": "IP", "params": {"ef": 64}},
-            limit=top_k * 2,  # 多取一些用于融合
+            param={"metric_type": "IP", "params": {"ef": effective_ef}},
+            limit=actual_search_k,  # 多取一些用于融合
             expr=filter_expr,
         )
         
@@ -239,7 +312,7 @@ class MilvusManager:
             data=[sparse_embedding],
             anns_field="sparse_embedding",
             param={"metric_type": "IP", "params": {"drop_ratio_search": 0.2}},
-            limit=top_k * 2,
+            limit=actual_search_k,
             expr=filter_expr,
         )
         
@@ -280,12 +353,23 @@ class MilvusManager:
         """
         仅使用密集向量检索（降级模式，用于稀疏向量不可用时）
         """
+        actual_search_k = max(1, top_k)
+        effective_ef = self._resolve_effective_ef(actual_search_k)
+        self._log_search_params(
+            retrieval_type="dense",
+            candidate_k=top_k,
+            final_top_k=top_k,
+            actual_search_k=actual_search_k,
+            final_limit=top_k,
+            metric_type="IP",
+            effective_ef=effective_ef,
+        )
         results = self._run_with_reconnect(
             lambda client: client.search(
                 collection_name=self.collection_name,
                 data=[dense_embedding],
                 anns_field="dense_embedding",
-                search_params={"metric_type": "IP", "params": {"ef": 64}},
+                search_params={"metric_type": "IP", "params": {"ef": effective_ef}},
                 limit=top_k,
                 output_fields=[
                     "text",

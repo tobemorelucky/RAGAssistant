@@ -1,0 +1,32 @@
+时间：2026-05-01
+
+问题：
+1. 批量上传多个 PDF 后，前端“已上传文档”列表显示不完整。
+2. 刷新文档列表后，预期的新 PDF 没有全部出现。
+3. 上传进度提示存在乱码，影响文件名和阶段信息展示。
+
+原因定位：
+1. `backend/api.py` 的 `/documents` 接口只调用 `milvus_manager.query(..., limit=10000)`，
+   实际是从前 10000 条 chunk 记录里聚合文件名。大批量 PDF 会产生大量 chunk，
+   后上传的文档可能完全落在这个窗口之外，导致列表漏文档。
+2. 上传任务的步骤标签和部分前端批量上传提示存在历史乱码，前端会直接显示这些字符串。
+
+本次修改：
+1. `backend/api.py`
+   - `/documents` 改为使用 `milvus_manager.query_all(...)` 全量分页拉取后再聚合。
+   - 文档列表按文件名稳定排序，便于刷新后核对。
+   - 为上传解析完成、向量入库完成、上传失败、文档列表刷新增加最小必要日志。
+2. `backend/upload_jobs.py`
+   - 清理上传/删除任务步骤标签与默认状态文案，避免前端显示乱码。
+3. `frontend/script.js`
+   - 修复批量上传摘要提示文案乱码。
+   - 保留现有批量上传逻辑，只修正用户可见的提示文本。
+
+验证：
+1. `python -m py_compile backend/api.py backend/upload_jobs.py`
+2. `node --check frontend/script.js`
+
+备注：
+1. 本次未重构上传流程，只修复“列表聚合上限导致漏文档”和“上传提示乱码”。
+2. 若要进一步确认 10 个 FinanceBench PDF 是否全部入库，可结合新增日志查看每个文件的
+   `parent_chunks / leaf_chunks` 以及刷新列表时的 `rows / documents` 统计。
