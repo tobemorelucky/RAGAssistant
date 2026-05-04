@@ -77,17 +77,27 @@ def _parse_int(value: str | None, default: int) -> int:
         return default
 
 
+def _parse_retrieval_mode(value: str | None) -> str:
+    mode = (value or "baseline").strip().lower()
+    if mode not in {"baseline", "finance_experimental"}:
+        return "baseline"
+    return mode
+
+
 def get_finance_rag_config() -> Dict[str, Any]:
+    retrieval_mode = _parse_retrieval_mode(os.getenv("RAG_RETRIEVAL_MODE"))
     candidate_k = max(1, _parse_int(os.getenv("FINANCE_RAG_CANDIDATE_K"), 50))
     final_top_k = max(1, _parse_int(os.getenv("FINANCE_RAG_FINAL_TOP_K"), 10))
+    experimental_two_stage = _parse_bool(os.getenv("FINANCE_RAG_TWO_STAGE_RETRIEVAL"), True)
     return {
+        "retrieval_mode": retrieval_mode,
         "candidate_k": max(candidate_k, final_top_k),
         "final_top_k": final_top_k,
         "enable_step_back": _parse_bool(os.getenv("FINANCE_RAG_ENABLE_STEP_BACK"), False),
         "enable_page_merge": _parse_bool(os.getenv("FINANCE_RAG_ENABLE_PAGE_MERGE"), True),
         "adjacent_page_window": max(0, _parse_int(os.getenv("FINANCE_RAG_ADJACENT_PAGE_WINDOW"), 1)),
         "adjacent_chunk_window": max(0, _parse_int(os.getenv("FINANCE_RAG_ADJACENT_CHUNK_WINDOW"), 1)),
-        "two_stage_retrieval": _parse_bool(os.getenv("FINANCE_RAG_TWO_STAGE_RETRIEVAL"), True),
+        "two_stage_retrieval": retrieval_mode == "finance_experimental" and experimental_two_stage,
         "doc_stage_top_n": max(1, _parse_int(os.getenv("FINANCE_RAG_DOC_STAGE_TOP_N"), 5)),
         "page_stage_top_n": max(1, _parse_int(os.getenv("FINANCE_RAG_PAGE_STAGE_TOP_N"), 10)),
         "max_evidence_pack_used": max(1, _parse_int(os.getenv("FINANCE_RAG_MAX_EVIDENCE_PACK_USED"), 10)),
@@ -1311,6 +1321,8 @@ def finalize_retrieved_documents(
     adjacent_chunk_window: int | None = None,
 ) -> Dict[str, Any]:
     config = get_finance_rag_config()
+    retrieval_mode = config["retrieval_mode"]
+    experimental_mode = retrieval_mode == "finance_experimental"
     final_top_k = max(1, final_top_k or config["final_top_k"])
     enable_page_merge = config["enable_page_merge"] if enable_page_merge is None else enable_page_merge
     adjacent_page_window = config["adjacent_page_window"] if adjacent_page_window is None else max(0, adjacent_page_window)
@@ -1319,9 +1331,10 @@ def finalize_retrieved_documents(
     page_stage_top_n = max(config["page_stage_top_n"], final_top_k)
     logger.info(
         (
-            "finance_rag_finalize candidate_k=%s final_top_k=%s candidate_docs=%s "
+            "finance_rag_finalize retrieval_mode=%s candidate_k=%s final_top_k=%s candidate_docs=%s "
             "enable_page_merge=%s two_stage_retrieval=%s doc_stage_top_n=%s page_stage_top_n=%s"
         ),
+        retrieval_mode,
         config["candidate_k"],
         final_top_k,
         len(candidate_docs),
@@ -1331,23 +1344,13 @@ def finalize_retrieved_documents(
         page_stage_top_n,
     )
 
-    t_parse = time.perf_counter()
-    query_parse = parse_finance_query(query)
-    query_parse["raw_question"] = query
-    query_parse_ms = round((time.perf_counter() - t_parse) * 1000, 2)
-
     deduped_candidates = _deduplicate_docs(candidate_docs)
-    initial_rerank_top_k = max(final_top_k * 2, page_stage_top_n)
-    initial_reranked_docs, initial_rerank_meta = _rerank_documents(
-        query=query,
-        docs=deduped_candidates,
-        top_k=initial_rerank_top_k,
-    )
     stage_two_meta: Dict[str, Any] = {
+        "retrieval_mode": retrieval_mode,
         "two_stage_retrieval": config["two_stage_retrieval"],
         "doc_stage_top_n": doc_stage_top_n,
         "page_stage_top_n": page_stage_top_n,
-        "query_parse": query_parse,
+        "query_parse": {},
         "doc_stage_selected_docs": [],
         "selected_docs": [],
         "selected_pages": [],
@@ -1362,7 +1365,24 @@ def finalize_retrieved_documents(
         "fallback_reason": "",
     }
     rerank_meta: Dict[str, Any]
-    if config["two_stage_retrieval"]:
+    if experimental_mode:
+        t_parse = time.perf_counter()
+        query_parse = parse_finance_query(query)
+        query_parse["raw_question"] = query
+        query_parse_ms = round((time.perf_counter() - t_parse) * 1000, 2)
+        stage_two_meta["query_parse"] = query_parse
+        initial_rerank_top_k = max(final_top_k * 2, page_stage_top_n)
+        initial_reranked_docs, initial_rerank_meta = _rerank_documents(
+            query=query,
+            docs=deduped_candidates,
+            top_k=initial_rerank_top_k,
+        )
+    else:
+        query_parse_ms = 0.0
+        initial_reranked_docs = []
+        initial_rerank_meta = {}
+
+    if experimental_mode and config["two_stage_retrieval"]:
         t_page = time.perf_counter()
         stage_two_candidates, stage_two_rerank_meta = _run_two_stage_retrieval(
             query,
@@ -1446,7 +1466,7 @@ def finalize_retrieved_documents(
 
     meta = {
         **stage_two_meta,
-        **(initial_rerank_meta if config["two_stage_retrieval"] else {}),
+        **(initial_rerank_meta if experimental_mode and config["two_stage_retrieval"] else {}),
         **rerank_meta,
         **merge_meta,
         **page_merge_meta,
@@ -1466,10 +1486,11 @@ def finalize_retrieved_documents(
         logger.warning("WARNING: query-time page embedding executed; this should be cached/precomputed.")
     logger.info(
         (
-            "finance_rag_finalize_result final_retrieved_count=%s final_page_distribution=%s "
+            "finance_rag_finalize_result retrieval_mode=%s final_retrieved_count=%s final_page_distribution=%s "
             "final_page_zero_count=%s cover_page_filtered_count=%s fallback_used=%s "
             "query_parse_ms=%s page_rerank_ms=%s pack_used=%s prompt_chars=%s cache_hit=%s cache_miss=%s"
         ),
+        retrieval_mode,
         len(final_docs),
         _page_distribution(final_docs),
         _page_zero_count(final_docs),
@@ -1543,9 +1564,15 @@ def debug_retrieval_pipeline(question: str, top_k: int = 10) -> Dict[str, Any]:
         "question": question,
         "query_parse": meta.get("query_parse", {}),
         "rag_trace": {
+            "retrieval_mode": meta.get("retrieval_mode", "baseline"),
+            "two_stage_retrieval": meta.get("two_stage_retrieval", False),
             "selected_docs": meta.get("selected_docs", []) or meta.get("doc_stage_selected_docs", []) or [],
             "selected_pages": meta.get("selected_pages", []) or [],
             "page_scores": meta.get("page_scores", []) or [],
+            "final_retrieved_chunks": [
+                _trace_chunk(doc, idx)
+                for idx, doc in enumerate(result.get("final_retrieved_docs", []) or [], 1)
+            ],
             "final_evidence_pack_debug": [
                 _trace_chunk(doc, idx)
                 for idx, doc in enumerate(meta.get("final_evidence_pack_debug", []) or [], 1)

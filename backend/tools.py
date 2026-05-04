@@ -178,6 +178,7 @@ def search_knowledge_base(query: str) -> str:
     rag_trace = rag_result.get("rag_trace", {}) if isinstance(rag_result, dict) else {}
     if rag_trace:
         _set_last_rag_context({"rag_trace": rag_trace})
+    retrieval_mode = (rag_trace or {}).get("retrieval_mode") or "baseline"
 
     if not docs:
         return "No relevant documents found in the knowledge base."
@@ -191,14 +192,24 @@ def search_knowledge_base(query: str) -> str:
         text = result.get("text", "")
         formatted.append(f"[{i}] {doc_name} | {source} | Page {page} | Type {evidence_type}:\n{text}")
 
+    if retrieval_mode == "finance_experimental":
+        return (
+            "Retrieved Evidence Pack:\n"
+            + "\n\n---\n\n".join(formatted)
+            + "\n\nAnswering Rules:\n"
+            + "- Use only the evidence above.\n"
+            + "- Prefer evidence that best matches the user's company, year, and document type.\n"
+            + "- If a calculation is needed, show the formula and the numbers you used.\n"
+            + "- If evidence is incomplete, say which field is missing.\n"
+            + "- Do not invent numbers that are not present in the evidence above."
+        )
+
     return (
-        "Final Evidence Pack Used:\n"
+        "Retrieved Context:\n"
         + "\n\n---\n\n".join(formatted)
         + "\n\nAnswering Rules:\n"
-        + "- Use only the evidence above.\n"
-        + "- First extract document, page, metric, period, value, and unit.\n"
-        + "- If calculation is needed, show formula, operands, and calculation.\n"
-        + "- If the evidence is insufficient, name the specific missing field.\n"
-        + "- Do not use evidence with mismatched company, year, or document type when better-matching evidence exists above.\n"
-        + "- Do not invent numbers that are not present in the evidence above."
+        + "- Use the retrieved context above to answer the question.\n"
+        + "- If the context is relevant but partial, provide the best grounded answer and briefly note any uncertainty.\n"
+        + "- Cite the supporting document and page when available.\n"
+        + "- Do not invent facts that are not supported by the retrieved context."
     )

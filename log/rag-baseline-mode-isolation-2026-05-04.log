@@ -1,0 +1,26 @@
+2026-05-04
+
+Scope:
+- Restore a stable baseline RAG path as the default.
+- Keep finance experimental retrieval available behind an explicit mode switch.
+- Do not remove existing safety and infrastructure fixes.
+
+Changed files:
+- backend/rag_utils.py
+- backend/rag_pipeline.py
+- backend/tools.py
+- backend/agent.py
+- .env.example
+
+Changes:
+- Added RAG_RETRIEVAL_MODE with default baseline.
+- Baseline mode now uses the stable chunk-level path:
+  - global hybrid retrieval
+  - rerank
+  - auto-merge
+  - page_merge context expansion
+- Baseline mode does not use query parser filtering, page-level index takeover, or page-level evidence-pack prompt override.
+- finance_experimental mode keeps the current page-level/query-parser/evidence-pack path, but it is no longer the default.
+- search_knowledge_base now formats baseline results as generic Retrieved Context, while finance_experimental keeps Retrieved Evidence Pack wording.
+- Simplified the agent prompt back to general RAG answering behavior so baseline is less over-constrained and less refusal-prone.
+- Preserved existing trace and compatibility fields, while exposing retrieval_mode in debug output.

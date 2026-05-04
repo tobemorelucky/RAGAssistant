@@ -828,6 +828,9 @@ textarea {
     font-size: 0.85rem;
     border-radius: 7px;
     gap: 4px;
+    min-width: 132px;
+    min-height: 36px;
+    justify-content: center;
 }
 
 .upload-area {
