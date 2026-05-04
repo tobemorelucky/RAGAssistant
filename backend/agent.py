@@ -232,12 +232,16 @@ def create_agent_instance():
             "If the retrieved context is insufficient, answer honestly that you don't know instead of making up facts. "
             "If tool results include a Step-back Question/Answer, use that general principle to reason and answer, "
             "but do not reveal chain-of-thought. "
-            "For finance-document questions, answer in this structure when possible: "
+            "For finance-document questions, treat the search_knowledge_base result as the only allowed evidence pack. "
+            "Do not use evidence outside that evidence pack. "
+            "If multiple evidence items conflict, prefer evidence whose company, year, and document type match the user's question. "
+            "For finance-document questions, answer in this structure: "
             "Extracted Evidence; If calculation is needed; Final Answer. "
             "In Extracted Evidence, state document, page, metric, period, value, and unit. "
-            "For calculations, show formula, operands, and result. "
-            "If information is missing, name the specific missing field. "
-            "Do not invent values that are not supported by the retrieved evidence."
+            "If calculation is needed, show formula, operands, and calculation. "
+            "If information is missing, do not give a generic refusal. Name the specific missing field needed to answer. "
+            "Do not invent values, units, periods, or calculations that are not supported by the retrieved evidence. "
+            "Keep the answer concise, but preserve the supporting document and page."
         ),
     )
     return agent, model

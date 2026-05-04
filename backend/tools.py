@@ -191,4 +191,14 @@ def search_knowledge_base(query: str) -> str:
         text = result.get("text", "")
         formatted.append(f"[{i}] {doc_name} | {source} | Page {page} | Type {evidence_type}:\n{text}")
 
-    return "Retrieved Chunks:\n" + "\n\n---\n\n".join(formatted)
+    return (
+        "Final Evidence Pack Used:\n"
+        + "\n\n---\n\n".join(formatted)
+        + "\n\nAnswering Rules:\n"
+        + "- Use only the evidence above.\n"
+        + "- First extract document, page, metric, period, value, and unit.\n"
+        + "- If calculation is needed, show formula, operands, and calculation.\n"
+        + "- If the evidence is insufficient, name the specific missing field.\n"
+        + "- Do not use evidence with mismatched company, year, or document type when better-matching evidence exists above.\n"
+        + "- Do not invent numbers that are not present in the evidence above."
+    )

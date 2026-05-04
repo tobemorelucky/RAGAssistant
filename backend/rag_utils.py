@@ -632,6 +632,10 @@ def _score_candidate_pages(
         table_text = page.get("table_text", "") or ""
         dense_embedding = page.get("page_dense_embedding") or []
         combined_text = "\n".join([page_text, table_text]).strip()
+        table_tokens = _extract_keyword_tokens(table_text)
+        table_numbers = _extract_numbers(table_text)
+        table_years = _extract_years(table_text)
+        table_metrics = _extract_metric_hints(table_text)
         page_tokens = set(page.get("page_tokens") or _extract_keyword_tokens(combined_text))
         page_numbers = set(page.get("page_numbers") or _extract_numbers(combined_text))
         page_years = set(page.get("page_years") or _extract_years(combined_text))
@@ -642,6 +646,16 @@ def _score_candidate_pages(
         token_overlap = _score_overlap(query_tokens, page_tokens)
         metric_overlap = _score_overlap(query_metrics, page_metrics)
         number_overlap = max(_score_overlap(query_numbers, page_numbers), _score_overlap(query_years, page_years))
+        table_metric_overlap = _score_overlap(query_metrics, table_metrics)
+        table_number_overlap = max(_score_overlap(query_numbers, table_numbers), _score_overlap(query_years, table_years))
+        table_keyword_overlap = _score_overlap(query_tokens, table_tokens)
+        table_signal_score = 0.0
+        if table_text.strip():
+            table_signal_score = max(
+                table_metric_overlap,
+                table_number_overlap,
+                table_keyword_overlap * 0.5,
+            )
         initial_chunk_hit_score = initial_page_score_map.get(
             ((page.get("filename") or ""), _coerce_int(page.get("page_number")) or 0),
             0.0,
@@ -677,6 +691,8 @@ def _score_candidate_pages(
                 "company_match_score": company_match_score,
                 "year_match_score": year_match_score,
                 "doc_type_match_score": doc_type_match_score,
+                "table_signal_score": table_signal_score,
+                "has_table_text": bool(table_text.strip()),
                 "initial_chunk_hit_score": initial_chunk_hit_score,
                 "cover_toc_penalty": cover_penalty,
                 "cover_like": cover_penalty > 0,
@@ -701,6 +717,7 @@ def _score_candidate_pages(
             + config["w_year"] * page["year_match_score"]
             + config["w_doc_type"] * page["doc_type_match_score"]
             + 0.08 * page["initial_chunk_hit_score_norm"]
+            + 0.12 * page["table_signal_score"]
             - page["cover_toc_penalty"]
         )
         if target_company and page["company_match_score"] <= 0:
@@ -725,6 +742,8 @@ def _score_candidate_pages(
                 "company_match_score": round(page["company_match_score"], 6),
                 "year_match_score": round(page["year_match_score"], 6),
                 "doc_type_match_score": round(page["doc_type_match_score"], 6),
+                "table_signal_score": round(page["table_signal_score"], 6),
+                "has_table_text": page["has_table_text"],
                 "initial_chunk_hit_score": round(page["initial_chunk_hit_score_norm"], 6),
                 "final_score": round(final_score, 6),
                 "page_score": round(final_score, 6),
@@ -882,7 +901,11 @@ def _build_evidence_pack(
         year_match = 1 if (not target_years or bool(target_years & entry_years)) else 0
         company_match = 1 if (not query_parse.get("company") or matches_company_text("\n".join([filename, text]), query_parse.get("company") or "")) else 0
         doc_type_match = 1 if (not target_doc_types or infer_doc_type("\n".join([filename, text])) in target_doc_types) else 0
-        table_bonus = 1 if entry.get("type") == "table_text" else 0
+        table_bonus = 0
+        if entry.get("type") == "table_text":
+            table_bonus = 1
+            table_bonus += len(_extract_metric_hints(text) & set(query_parse.get("metrics") or []))
+            table_bonus += len(_extract_numbers(text) & set(query_parse.get("numbers") or []))
         metric_bonus = len(_extract_metric_hints(text) & set(query_parse.get("metrics") or []))
         number_bonus = len(_extract_numbers(text) & set(query_parse.get("numbers") or []))
         return (
@@ -1048,6 +1071,8 @@ def _run_two_stage_retrieval(
                 "company_match_score": page.get("company_match_score"),
                 "year_match_score": page.get("year_match_score"),
                 "doc_type_match_score": page.get("doc_type_match_score"),
+                "table_signal_score": page.get("table_signal_score"),
+                "has_table_text": page.get("has_table_text"),
                 "initial_chunk_hit_score": page.get("initial_chunk_hit_score"),
                 "cover_toc_penalty": page.get("cover_toc_penalty"),
                 "final_score": page.get("final_score"),

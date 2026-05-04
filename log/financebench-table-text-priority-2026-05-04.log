@@ -1,0 +1,16 @@
+2026-05-04
+
+Scope:
+- Minimal FinanceBench / financial RAG retrieval adjustment.
+- Only prioritize existing page index table_text.
+- No OCR, no hi_res parsing dependency, no table-system refactor.
+
+Changed files:
+- backend/rag_utils.py
+
+Changes:
+- Added a small page-level table signal score when a page already has non-empty table_text.
+- The table signal is derived from overlap between query metrics / numbers / years / tokens and the existing table_text only.
+- Added a modest score bonus so pages with relevant existing table_text are ranked ahead of similar pages without it.
+- Strengthened final_evidence_pack_used ordering so relevant table_text entries on matched pages are preferred earlier.
+- Exposed has_table_text and table_signal_score in page_scores for easier debugging.

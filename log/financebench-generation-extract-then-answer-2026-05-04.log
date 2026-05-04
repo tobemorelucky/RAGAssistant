@@ -1,0 +1,21 @@
+2026-05-04
+
+Scope:
+- Only adjusted FinanceBench / financial RAG answer-generation behavior.
+- Did not modify retrieval, rerank, evidence pack construction, evaluator, or frontend.
+
+Changed files:
+- backend/agent.py
+- backend/tools.py
+
+Changes:
+- Tightened the finance-document system prompt to force extract-then-answer behavior.
+- Instructed the model to treat search_knowledge_base output as the only allowed evidence pack.
+- Required concise output with:
+  - Extracted Evidence
+  - If calculation is needed
+  - Final Answer
+- Required the model to name the specific missing field instead of giving a generic refusal.
+- Required the model to avoid mismatched company/year/doc_type evidence when better-matching evidence exists.
+- Reformatted search_knowledge_base tool output to label the returned context as Final Evidence Pack Used.
+- Added explicit answering rules to the tool result so the model stays grounded in the provided evidence.
