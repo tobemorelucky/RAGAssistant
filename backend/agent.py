@@ -2,6 +2,7 @@ from dotenv import load_dotenv
 import os
 import json
 import asyncio
+import time
 from langchain.chat_models import init_chat_model
 from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage, AIMessage, AIMessageChunk, SystemMessage
@@ -231,7 +232,12 @@ def create_agent_instance():
             "If the retrieved context is insufficient, answer honestly that you don't know instead of making up facts. "
             "If tool results include a Step-back Question/Answer, use that general principle to reason and answer, "
             "but do not reveal chain-of-thought. "
-            "If you don't know the answer, admit it honestly."
+            "For finance-document questions, answer in this structure when possible: "
+            "Extracted Evidence; If calculation is needed; Final Answer. "
+            "In Extracted Evidence, state document, page, metric, period, value, and unit. "
+            "For calculations, show formula, operands, and result. "
+            "If information is missing, name the specific missing field. "
+            "Do not invent values that are not supported by the retrieved evidence."
         ),
     )
     return agent, model
@@ -261,6 +267,7 @@ def summarize_old_messages(model, messages: list) -> str:
 
 def chat_with_agent(user_text: str, user_id: str = "default_user", session_id: str = "default_session"):
     """使用 Agent 处理用户消息并返回响应"""
+    started_at = time.perf_counter()
     messages = storage.load(user_id, session_id)
 
     # 清理可能残留的 RAG 上下文，避免跨请求污染
@@ -298,6 +305,16 @@ def chat_with_agent(user_text: str, user_id: str = "default_user", session_id: s
 
     rag_context = get_last_rag_context(clear=True)
     rag_trace = rag_context.get("rag_trace") if rag_context else None
+    if rag_trace is not None:
+        total_latency_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        breakdown = dict(rag_trace.get("latency_breakdown") or {})
+        retrieval_ms = sum(
+            float(breakdown.get(key, 0.0) or 0.0)
+            for key in ("query_parse_ms", "initial_retrieval_ms", "page_rerank_ms")
+        )
+        breakdown["generation_latency_ms"] = round(max(0.0, total_latency_ms - retrieval_ms), 2)
+        breakdown["total_latency_ms"] = total_latency_ms
+        rag_trace["latency_breakdown"] = breakdown
 
     extra_message_data = [None] * (len(messages) - 1) + [{"rag_trace": rag_trace}]
     storage.save(user_id, session_id, messages, extra_message_data=extra_message_data)

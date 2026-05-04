@@ -822,6 +822,14 @@ textarea {
     margin-bottom: 15px;
 }
 
+.document-actions .btn-secondary,
+.document-actions .btn-danger {
+    padding: 7px 12px;
+    font-size: 0.85rem;
+    border-radius: 7px;
+    gap: 4px;
+}
+
 .upload-area {
     display: flex;
     flex-direction: column;

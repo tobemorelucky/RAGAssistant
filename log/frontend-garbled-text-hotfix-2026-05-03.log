@@ -1,0 +1,17 @@
+2026-05-03
+
+功能：前端乱码与提示文案最小修复
+
+修改文件：
+- frontend/index.html
+- frontend/script.js
+
+修改说明：
+- 修复首页、侧边栏、登录面板、文档管理页、历史会话、聊天区中的乱码文案。
+- 修复 index.html 中因乱码导致的损坏标签与属性，避免输入框 placeholder、按钮 title 等渲染异常。
+- 修复前端脚本中的登录、上传、删除、会话加载等用户提示文案乱码。
+- 保留原有前端结构、样式和业务逻辑，仅做显示层和提示语层面的最小必要修改。
+
+验证：
+- node --check frontend/script.js
+- 检查 frontend/index.html 中 placeholder/title/closing tag 已恢复正常

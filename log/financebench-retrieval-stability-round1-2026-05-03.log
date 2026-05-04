@@ -1,0 +1,24 @@
+2026-05-03
+
+功能：FinanceBench 检索主路径稳定性修复（第一轮）
+
+修改文件：
+- backend/query_parser.py
+- backend/finance_rag_features.py
+- backend/rag_utils.py
+- backend/document_page_store.py
+- backend/scripts/rebuild_page_index.py
+- backend/tests/test_query_parser.py
+- .env.example
+
+修改说明：
+- 将 query parser 独立为 backend/query_parser.py，增强公司、年份、季度、doc_type、metric 识别。
+- 强化 ticker alias 识别规则，避免 BA 被误命中到普通单词。
+- page rerank 增加 company/year/doc_type 强约束，并返回 filter_reason / penalty_reason。
+- final_evidence_pack_used 增加最小数量控制与补足逻辑，优先同公司、同年份、同指标候选。
+- 查询阶段继续保持只编码 query，不对 page_text 做 query-time embedding。
+- rebuild_page_index 脚本增加 embedding batch 输出，便于回建跟踪。
+- 增加 query parser 的 4 条轻量回归测试样例。
+
+验证：
+- python -m py_compile backend\\query_parser.py backend\\finance_rag_features.py backend\\rag_utils.py backend\\document_page_store.py backend\\scripts\\rebuild_page_index.py backend\\tests\\test_query_parser.py

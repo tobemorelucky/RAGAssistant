@@ -160,6 +160,15 @@ def _update_trace_from_finalization(trace: dict, finalization: dict) -> dict:
             "selected_pages": meta.get("selected_pages", []) or [],
             "page_scores": meta.get("page_scores", []) or [],
             "final_evidence_pack": _normalize_trace_chunks(meta.get("final_evidence_pack", []) or context_docs or final_docs),
+            "final_evidence_pack_debug": _normalize_trace_chunks(meta.get("final_evidence_pack_debug", []) or []),
+            "final_evidence_pack_used": _normalize_trace_chunks(meta.get("final_evidence_pack_used", []) or context_docs or final_docs),
+            "final_evidence_pack_debug_count": meta.get("final_evidence_pack_debug_count"),
+            "final_evidence_pack_used_count": meta.get("final_evidence_pack_used_count"),
+            "dropped_evidence_count": meta.get("dropped_evidence_count"),
+            "dropped_reasons": meta.get("dropped_reasons"),
+            "prompt_context_char_count_estimate": meta.get("prompt_context_char_count_estimate"),
+            "query_parse": meta.get("query_parse"),
+            "latency_breakdown": meta.get("latency_breakdown"),
             "two_stage_retrieval": meta.get("two_stage_retrieval"),
             "doc_stage_top_n": meta.get("doc_stage_top_n"),
             "page_stage_top_n": meta.get("page_stage_top_n"),
@@ -178,6 +187,7 @@ def _update_trace_from_finalization(trace: dict, finalization: dict) -> dict:
             "final_context_chunk_count": meta.get("final_context_chunk_count"),
             "cover_page_filtered_count": meta.get("cover_page_filtered_count"),
             "fallback_used": meta.get("fallback_used"),
+            "fallback_reason": meta.get("fallback_reason"),
         }
     )
     return trace
@@ -196,6 +206,7 @@ def _log_rag_diagnostics(rag_trace: dict | None) -> None:
         "candidate_k": rag_trace.get("candidate_k"),
         "final_top_k": rag_trace.get("final_top_k"),
         "two_stage_retrieval": rag_trace.get("two_stage_retrieval"),
+        "query_parse": rag_trace.get("query_parse"),
         "doc_stage_selected_docs": rag_trace.get("doc_stage_selected_docs"),
         "selected_pages": [
             {
@@ -206,7 +217,12 @@ def _log_rag_diagnostics(rag_trace: dict | None) -> None:
             }
             for page in rag_trace.get("selected_pages", []) or []
         ],
-        "final_evidence_pack_count": len(rag_trace.get("final_evidence_pack", []) or []),
+        "final_evidence_pack_debug_count": rag_trace.get("final_evidence_pack_debug_count"),
+        "final_evidence_pack_used_count": rag_trace.get("final_evidence_pack_used_count"),
+        "dropped_evidence_count": rag_trace.get("dropped_evidence_count"),
+        "dropped_reasons": rag_trace.get("dropped_reasons"),
+        "prompt_context_char_count_estimate": rag_trace.get("prompt_context_char_count_estimate"),
+        "latency_breakdown": rag_trace.get("latency_breakdown"),
         "initial_retrieved": [
             {
                 "filename": chunk.get("filename"),
@@ -244,6 +260,7 @@ def _log_rag_diagnostics(rag_trace: dict | None) -> None:
         "final_context_chunk_count": rag_trace.get("final_context_chunk_count"),
         "cover_page_filtered_count": rag_trace.get("cover_page_filtered_count"),
         "fallback_used": rag_trace.get("fallback_used"),
+        "fallback_reason": rag_trace.get("fallback_reason"),
     }
     logger.info("finance_rag_trace %s", json.dumps(payload, ensure_ascii=False))
 

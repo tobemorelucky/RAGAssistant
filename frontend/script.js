@@ -112,7 +112,7 @@ createApp({
         async fetchMe() {
             const response = await this.authFetch('/auth/me');
             if (!response.ok) {
-                throw new Error('璁よ瘉澶辫触');
+                throw new Error('认证失败');
             }
             this.currentUser = await response.json();
         },
@@ -122,7 +122,7 @@ createApp({
             const username = this.authForm.username.trim();
             const password = this.authForm.password.trim();
             if (!username || !password) {
-                alert('鐢ㄦ埛鍚嶅拰瀵嗙爜涓嶈兘涓虹┖');
+                alert('用户名和密码不能为空');
                 return;
             }
 
@@ -146,7 +146,7 @@ createApp({
 
                 const data = await response.json().catch(() => ({}));
                 if (!response.ok) {
-                    throw new Error(data.detail || '璁よ瘉澶辫触');
+                    throw new Error(data.detail || '认证失败');
                 }
 
                 this.token = data.access_token;
@@ -199,7 +199,7 @@ createApp({
 
         async handleSend() {
             if (!this.isAuthenticated) {
-                alert('璇峰厛鐧诲綍');
+                alert('请先登录');
                 return;
             }
 
@@ -290,13 +290,13 @@ createApp({
                 if (error.name === 'AbortError') {
                     this.messages[botMsgIdx].isThinking = false;
                     if (!this.messages[botMsgIdx].text) {
-                        this.messages[botMsgIdx].text = '(宸茬粓姝㈠洖绛?';
+                        this.messages[botMsgIdx].text = '(已终止回答)';
                     } else {
-                        this.messages[botMsgIdx].text += '\n\n_(鍥炵瓟宸茶缁堟)_';
+                        this.messages[botMsgIdx].text += '\n\n_(回答已被终止)_';
                     }
                 } else {
                     this.messages[botMsgIdx].isThinking = false;
-                    this.messages[botMsgIdx].text = `鍠靛憸... 鍑轰簡鐐归棶棰橈細${error.message}`;
+                    this.messages[botMsgIdx].text = `喵喵开小差了：${error.message}`;
                 }
             } finally {
                 this.isLoading = false;
@@ -344,7 +344,7 @@ createApp({
             try {
                 const response = await this.authFetch('/sessions');
                 if (!response.ok) {
-                    throw new Error('Failed to load sessions');
+                    throw new Error('加载历史记录失败');
                 }
                 const data = await response.json();
                 this.sessions = data.sessions;
@@ -361,7 +361,7 @@ createApp({
             try {
                 const response = await this.authFetch(`/sessions/${encodeURIComponent(sessionId)}`);
                 if (!response.ok) {
-                    throw new Error('Failed to load session messages');
+                    throw new Error('加载会话消息失败');
                 }
                 const data = await response.json();
                 this.messages = data.messages.map(msg => ({
@@ -380,7 +380,7 @@ createApp({
         },
 
         async deleteSession(sessionId) {
-            if (!confirm(`纭畾瑕佸垹闄や細璇?"${sessionId}" 鍚楋紵`)) {
+            if (!confirm(`确定要删除会话 "${sessionId}" 吗？`)) {
                 return;
             }
 
@@ -391,7 +391,7 @@ createApp({
 
                 const payload = await response.json().catch(() => ({}));
                 if (!response.ok) {
-                    throw new Error(payload.detail || 'Delete failed');
+                    throw new Error(payload.detail || '删除失败');
                 }
 
                 this.sessions = this.sessions.filter(s => s.session_id !== sessionId);
@@ -447,7 +447,7 @@ createApp({
                 const response = await this.authFetch('/documents');
                 if (!response.ok) {
                     const data = await response.json().catch(() => ({}));
-                    throw new Error(data.detail || 'Failed to load documents');
+                    throw new Error(data.detail || '加载文档列表失败');
                 }
                 const data = await response.json();
                 this.documents = this.mergeDocumentsWithActiveDeletes(data.documents);
@@ -511,10 +511,10 @@ createApp({
 
         createUploadSteps() {
             return [
-                { key: 'upload', label: '鏂囨。涓婁紶', percent: 0, status: 'pending', message: '' },
+                { key: 'upload', label: '文档上传', percent: 0, status: 'pending', message: '' },
                 { key: 'cleanup', label: '清理旧版本', percent: 0, status: 'pending', message: '' },
                 { key: 'parse', label: '解析与分块', percent: 0, status: 'pending', message: '' },
-                { key: 'parent_store', label: '鐖剁骇鍒嗗潡鍏ュ簱', percent: 0, status: 'pending', message: '' },
+                { key: 'parent_store', label: '父级分块入库', percent: 0, status: 'pending', message: '' },
                 { key: 'vector_store', label: '向量化入库', percent: 0, status: 'pending', message: '' },
             ];
         },
@@ -546,7 +546,7 @@ createApp({
                 xhr.upload.onprogress = (event) => {
                     if (!event.lengthComputable) return;
                     const percent = Math.round((event.loaded / event.total) * 100);
-                    this.updateUploadStep('upload', percent, 'running', `宸蹭笂浼?${percent}%`);
+                    this.updateUploadStep('upload', percent, 'running', `已上传 ${percent}%`);
                 };
 
                 xhr.onload = () => {
@@ -560,7 +560,7 @@ createApp({
                     try {
                         data = JSON.parse(xhr.responseText || '{}');
                     } catch (e) {
-                        reject(new Error('涓婁紶鍝嶅簲瑙ｆ瀽澶辫触'));
+                        reject(new Error('上传响应解析失败'));
                         return;
                     }
 
@@ -569,11 +569,11 @@ createApp({
                         return;
                     }
 
-                    this.updateUploadStep('upload', 100, 'completed', '鏂囨。涓婁紶瀹屾垚');
+                    this.updateUploadStep('upload', 100, 'completed', '文档上传完成');
                     resolve(data);
                 };
 
-                xhr.onerror = () => reject(new Error('涓婁紶璇锋眰澶辫触'));
+                xhr.onerror = () => reject(new Error('上传请求失败'));
                 xhr.onabort = () => reject(new Error('上传已取消'));
                 xhr.send(formData);
             });
@@ -591,7 +591,7 @@ createApp({
                     message: step.message || ''
                 }));
             }
-            // 鍏ュ簱鎴愬姛鍚庤嚜鍔ㄦ敹璧锋楠ゆ槑缁嗭紝淇濈暀鎽樿渚涚敤鎴峰啀娆″睍寮€鏌ョ湅銆?
+            // 入库成功后自动收起步骤明细，保留摘要供用户再次展开查看。
             if (job.status === 'completed') {
                 this.uploadProgressCollapsed = true;
             }
@@ -624,7 +624,7 @@ createApp({
                 const response = await this.authFetch(`/documents/upload/jobs/${encodeURIComponent(jobId)}`);
                 if (!response.ok) {
                     const error = await response.json().catch(() => ({}));
-                    throw new Error(error.detail || 'Failed to load upload job');
+                    throw new Error(error.detail || '加载上传任务失败');
                 }
 
                 const job = await response.json();
@@ -645,7 +645,7 @@ createApp({
 
         async uploadSelectedFiles() {
             if (!this.selectedFiles.length) {
-                alert('璇峰厛閫夋嫨鏂囦欢');
+                alert('请先选择文件');
                 return;
             }
 
@@ -661,8 +661,8 @@ createApp({
                     const file = this.selectedFiles[index];
                     this.uploadSteps = this.createUploadSteps();
                     this.activeUploadJobId = '';
-                    this.uploadProgress = `(${index + 1}/${total}) 姝ｅ湪涓婁紶 ${file.name}`;
-                    this.updateUploadStep('upload', 0, 'running', `鍑嗗涓婁紶 ${file.name}`);
+                    this.uploadProgress = `(${index + 1}/${total}) 正在上传 ${file.name}`;
+                    this.updateUploadStep('upload', 0, 'running', `准备上传 ${file.name}`);
 
                     try {
                         const data = await this.uploadFileWithProgress(file);
@@ -697,7 +697,7 @@ createApp({
                     const response = await this.authFetch(`/documents/upload/jobs/${encodeURIComponent(jobId)}`);
                     if (!response.ok) {
                         const error = await response.json().catch(() => ({}));
-                        throw new Error(error.detail || 'Failed to load upload job');
+                        throw new Error(error.detail || '加载上传任务失败');
                     }
 
                     const job = await response.json();
@@ -725,15 +725,15 @@ createApp({
 
         async uploadDocument() {
             if (!this.selectedFiles.length) {
-                alert('璇峰厛閫夋嫨鏂囦欢');
+                alert('请先选择文件');
                 return;
             }
 
             this.isUploading = true;
-            this.uploadProgress = '姝ｅ湪涓婁紶...';
+            this.uploadProgress = '正在上传...';
             this.uploadSteps = this.createUploadSteps();
             this.uploadProgressCollapsed = false;
-            this.updateUploadStep('upload', 0, 'running', '鍑嗗涓婁紶');
+            this.updateUploadStep('upload', 0, 'running', '准备上传');
 
             try {
                 const data = await this.uploadFileWithProgress(this.selectedFiles[0]);
@@ -749,10 +749,10 @@ createApp({
 
         createDeleteSteps() {
             return [
-                { key: 'prepare', label: '鍑嗗鍒犻櫎', percent: 0, status: 'pending', message: '' },
-                { key: 'bm25', label: '鍚屾 BM25 缁熻', percent: 0, status: 'pending', message: '' },
-                { key: 'milvus', label: '鍒犻櫎鍚戦噺鏁版嵁', percent: 0, status: 'pending', message: '' },
-                { key: 'parent_store', label: '鍒犻櫎鐖剁骇鍒嗗潡', percent: 0, status: 'pending', message: '' },
+                { key: 'prepare', label: '准备删除', percent: 0, status: 'pending', message: '' },
+                { key: 'bm25', label: '同步 BM25 统计', percent: 0, status: 'pending', message: '' },
+                { key: 'milvus', label: '删除向量数据', percent: 0, status: 'pending', message: '' },
+                { key: 'parent_store', label: '删除父级分块', percent: 0, status: 'pending', message: '' },
             ];
         },
 
@@ -785,7 +785,7 @@ createApp({
 
         syncDeleteJob(filename, job) {
             const current = this.deleteJobs[filename] || {};
-            // 鍚庣杩斿洖缁熶竴鐨勬楠ょ粨鏋勶紝鍓嶇鍙礋璐ｅ悓姝ュ埌褰撳墠鏂囨。琛屽唴鍗＄墖銆?
+            // 后端返回统一的步骤结构，前端只负责同步到当前文档行内卡片。
             this.setDeleteJob(filename, {
                 jobId: job.job_id,
                 status: job.status,
@@ -829,7 +829,7 @@ createApp({
 
         scheduleDeletedDocumentRemoval(filename) {
             this.clearDeleteRemovalTimer(filename);
-            // 鍒犻櫎瀹屾垚鍚庡厛淇濈暀 3 绉掓憳瑕侊紝鍐嶄粠褰撳墠鍒楄〃绉婚櫎骞跺埛鏂板悗绔姸鎬併€?
+            // 删除完成后先保留 3 秒摘要，再从当前列表移除并刷新后端状态。
             const timer = setTimeout(async () => {
                 this.documents = this.documents.filter(doc => doc.filename !== filename);
                 this.selectedDocumentFilenames = this.selectedDocumentFilenames.filter(item => item !== filename);
@@ -853,7 +853,7 @@ createApp({
                     const response = await this.authFetch(`/documents/delete/jobs/${encodeURIComponent(jobId)}`);
                     if (!response.ok) {
                         const error = await response.json().catch(() => ({}));
-                        throw new Error(error.detail || 'Failed to load delete job');
+                        throw new Error(error.detail || '加载删除任务失败');
                     }
 
                     const job = await response.json();
@@ -975,7 +975,7 @@ createApp({
                 this.setDeleteJob(filename, {
                     jobId: data.job_id,
                     status: 'running',
-                    message: data.message || `姝ｅ湪鍒犻櫎 ${filename}`,
+                    message: data.message || `正在删除 ${filename}`,
                     collapsed: false
                 });
                 this.startDeleteJobPolling(filename, data.job_id);

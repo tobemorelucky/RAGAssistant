@@ -31,6 +31,11 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = "default_session"
 
 
+class DebugRetrievalRequest(BaseModel):
+    question: str
+    top_k: int = 10
+
+
 class RetrievedChunk(BaseModel):
     rank: Optional[int] = None
     filename: str
@@ -85,6 +90,14 @@ class RagTrace(BaseModel):
     final_context_chunk_count: Optional[int] = None
     cover_page_filtered_count: Optional[int] = None
     fallback_used: Optional[bool] = None
+    fallback_reason: Optional[str] = None
+    query_parse: Optional[dict] = None
+    latency_breakdown: Optional[dict] = None
+    final_evidence_pack_debug_count: Optional[int] = None
+    final_evidence_pack_used_count: Optional[int] = None
+    dropped_evidence_count: Optional[int] = None
+    dropped_reasons: Optional[dict] = None
+    prompt_context_char_count_estimate: Optional[int] = None
     selected_docs: Optional[List[dict]] = None
     selected_pages: Optional[List[dict]] = None
     page_scores: Optional[List[dict]] = None
@@ -94,6 +107,8 @@ class RagTrace(BaseModel):
     page_stage_candidates: Optional[List[RetrievedChunk]] = None
     final_retrieved_chunks: Optional[List[RetrievedChunk]] = None
     final_evidence_pack: Optional[List[RetrievedChunk]] = None
+    final_evidence_pack_debug: Optional[List[RetrievedChunk]] = None
+    final_evidence_pack_used: Optional[List[RetrievedChunk]] = None
     doc_stage_selected_docs: Optional[List[dict]] = None
 
 

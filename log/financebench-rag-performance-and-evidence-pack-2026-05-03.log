@@ -1,0 +1,31 @@
+2026-05-03
+
+功能：FinanceBench RAG 性能与证据包最小修复
+
+修改文件：
+- backend/finance_rag_features.py
+- backend/models.py
+- backend/document_page_store.py
+- backend/rag_utils.py
+- backend/rag_pipeline.py
+- backend/agent.py
+- backend/api.py
+- backend/schemas.py
+- backend/scripts/rebuild_page_index.py
+- .env.example
+
+修改说明：
+- 新增轻量 query parser，识别公司、年份、季度、doc_type、metric keywords。
+- page-level rerank 改为查询时只编码 query，页面 dense embedding 改为上传/重建 page index 时预计算并持久化。
+- page-level keyword 部分改为基于预计算或轻量兜底的 page_tokens / years / numbers / metric tokens，不再对页面做 query-time sparse embedding。
+- 新增 final_evidence_pack_debug 与 final_evidence_pack_used，真正送给 LLM 的 evidence pack 默认限制为 10 条。
+- trace 中补充 query_parse、page score 组件、evidence pack 统计、dropped reasons、latency breakdown。
+- 新增 POST /debug/retrieval，只做 retrieval，不调用最终 LLM。
+- 新增 backend/scripts/rebuild_page_index.py，用于为旧 PDF 重建 page embedding 和页面特征。
+- Finance 文档回答 prompt 增加 extract-then-answer 约束。
+
+验证：
+- python -m py_compile backend\\finance_rag_features.py backend\\document_page_store.py backend\\models.py backend\\rag_utils.py backend\\rag_pipeline.py backend\\agent.py backend\\api.py backend\\schemas.py backend\\scripts\\rebuild_page_index.py
+
+备注：
+- 本轮没有改 embedding 模型、LLM judge、LangSmith evaluator，也没有删除 noisy KB 干扰文档。

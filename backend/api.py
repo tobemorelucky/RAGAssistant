@@ -17,11 +17,13 @@ from milvus_client import MilvusManager
 from milvus_writer import MilvusWriter
 from models import User
 from parent_chunk_store import ParentChunkStore
+from rag_utils import debug_retrieval_pipeline
 from schemas import (
     AuthResponse,
     ChatRequest,
     ChatResponse,
     CurrentUserResponse,
+    DebugRetrievalRequest,
     DocumentBatchDeleteRequest,
     DocumentBatchDeleteStartResponse,
     DocumentDeleteJobResponse,
@@ -202,6 +204,14 @@ def _is_supported_document(filename: str) -> bool:
         or file_lower.endswith((".xlsx", ".xls"))
         or file_lower.endswith((".txt", ".md", ".csv"))
     )
+
+
+@router.post("/debug/retrieval")
+async def debug_retrieval(request: DebugRetrievalRequest, _: User = Depends(require_admin)):
+    question = (request.question or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="question 不能为空")
+    return debug_retrieval_pipeline(question, top_k=max(1, request.top_k))
 
 
 async def _save_upload_file(file: UploadFile, file_path: Path) -> None:
