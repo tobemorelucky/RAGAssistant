@@ -824,13 +824,24 @@ textarea {
 
 .document-actions .btn-secondary,
 .document-actions .btn-danger {
-    padding: 7px 12px;
-    font-size: 0.85rem;
-    border-radius: 7px;
-    gap: 4px;
-    min-width: 132px;
-    min-height: 36px;
-    justify-content: center;
+  padding: 7px 12px;
+  font-size: 0.85rem;
+  border-radius: 7px;
+  gap: 4px;
+  min-width: 132px;
+  height: 36px;
+  margin-bottom: 0;
+  justify-content: center;
+  box-sizing: border-box;
+  line-height: 1;
+}
+
+.document-actions .btn-secondary:disabled,
+.document-actions .btn-danger:disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
+  transform: none;
+  box-shadow: none;
 }
 
 .upload-area {
