@@ -8,9 +8,11 @@ from typing import List
 
 try:
     from table_config import get_table_aware_config
+    from table_reconstructor import reconstruct_tables_from_words
     from text_sanitizer import sanitize_text
 except ModuleNotFoundError:
     from backend.table_config import get_table_aware_config
+    from backend.table_reconstructor import reconstruct_tables_from_words
     from backend.text_sanitizer import sanitize_text
 
 logger = logging.getLogger(__name__)
@@ -289,6 +291,9 @@ class TableAwareParser:
             logger.exception("pdfplumber table parsing failed filename=%s", filename)
             return []
 
+    def _extract_with_pdfplumber_words(self, file_path: str, filename: str, *, max_pages: int | None) -> list[dict]:
+        return reconstruct_tables_from_words(file_path, filename, max_pages=max_pages)
+
     def extract_tables(
         self,
         file_path: str,
@@ -306,7 +311,7 @@ class TableAwareParser:
             return []
 
         selected_backend = parser_backend or config.table_parser_backend
-        if selected_backend not in {"auto", "pdfplumber", "docling"}:
+        if selected_backend not in {"auto", "pdfplumber", "pdfplumber_words", "docling"}:
             selected_backend = "auto"
         effective_docling_ocr = config.table_docling_ocr if docling_ocr is None else bool(docling_ocr)
         effective_timeout_seconds = config.table_docling_timeout_seconds if timeout_seconds is None else max(1, int(timeout_seconds))
@@ -318,6 +323,9 @@ class TableAwareParser:
         if selected_backend == "pdfplumber":
             tables = self._extract_with_pdfplumber(file_path, filename, max_pages=effective_max_pages)
             resolved_backend = "pdfplumber" if tables else "none"
+        elif selected_backend == "pdfplumber_words":
+            tables = self._extract_with_pdfplumber_words(file_path, filename, max_pages=effective_max_pages)
+            resolved_backend = "pdfplumber_words" if tables else "none"
         elif selected_backend == "docling":
             tables = self._extract_with_docling(
                 file_path,

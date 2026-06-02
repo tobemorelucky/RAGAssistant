@@ -23,10 +23,10 @@ def test_parse_args_defaults():
 
 def test_parse_args_override_backend_and_docling_options():
     args = debug_table_parse.parse_args(
-        ["demo.pdf", "--backend", "pdfplumber", "--docling-ocr", "--timeout-seconds", "30", "--max-pages", "2"]
+        ["demo.pdf", "--backend", "pdfplumber_words", "--docling-ocr", "--timeout-seconds", "30", "--max-pages", "2"]
     )
 
-    assert args.backend == "pdfplumber"
+    assert args.backend == "pdfplumber_words"
     assert args.docling_ocr is True
     assert args.timeout_seconds == 30
     assert args.max_pages == 2
@@ -51,7 +51,7 @@ def test_build_report_contains_expected_fields():
         Path("demo.pdf"),
         [
             {
-                "parser_backend": "pdfplumber",
+                "parser_backend": "pdfplumber_words",
                 "page_number": 3,
                 "table_index": 1,
                 "table_id": "demo.pdf::table::p3::1",
@@ -64,14 +64,14 @@ def test_build_report_contains_expected_fields():
         ],
         max_tables=5,
         max_rows=5,
-        runtime_config={"backend": "pdfplumber", "docling_ocr": False, "timeout_seconds": 120, "max_pages": 3},
+        runtime_config={"backend": "pdfplumber_words", "docling_ocr": False, "timeout_seconds": 120, "max_pages": 3},
     )
 
     assert "filename: demo.pdf" in report
-    assert "backend: pdfplumber" in report
+    assert "backend: pdfplumber_words" in report
     assert "docling_ocr: False" in report
     assert "timeout_seconds: 120" in report
-    assert "parser_backend: pdfplumber" in report
+    assert "parser_backend: pdfplumber_words" in report
     assert "tables found: 1" in report
     assert "page_number: 3" in report
     assert "table_id: demo.pdf::table::p3::1" in report

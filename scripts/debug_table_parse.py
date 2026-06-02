@@ -22,7 +22,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-rows", type=int, default=5, help="每张表最多展示多少行，默认 5")
     parser.add_argument(
         "--backend",
-        choices=["auto", "pdfplumber", "docling"],
+        choices=["auto", "pdfplumber", "pdfplumber_words", "docling"],
         default=None,
         help="临时覆盖 TABLE_PARSER_BACKEND",
     )
@@ -93,7 +93,7 @@ def apply_runtime_overrides(args: argparse.Namespace) -> dict:
 
 def resolve_runtime_config(args: argparse.Namespace) -> dict:
     backend = args.backend or os.getenv("TABLE_PARSER_BACKEND", "auto").strip().lower() or "auto"
-    if backend not in {"auto", "pdfplumber", "docling"}:
+    if backend not in {"auto", "pdfplumber", "pdfplumber_words", "docling"}:
         backend = "auto"
 
     env_ocr = os.getenv("TABLE_DOCLING_OCR", "").strip().lower()

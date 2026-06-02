@@ -43,7 +43,7 @@ def _parse_retrieval_mode(value: str | None) -> str:
 
 def _parse_table_parser_backend(value: str | None) -> str:
     backend = (value or "auto").strip().lower()
-    if backend not in {"auto", "pdfplumber", "docling"}:
+    if backend not in {"auto", "pdfplumber", "pdfplumber_words", "docling"}:
         return "auto"
     return backend
 

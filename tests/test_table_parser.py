@@ -117,3 +117,41 @@ def test_extract_tables_docling_backend_returns_empty_when_docling_unavailable(m
     parser = TableAwareParser()
 
     assert parser.extract_tables("demo.pdf", "demo.pdf") == []
+
+
+def test_extract_tables_pdfplumber_words_backend(monkeypatch):
+    monkeypatch.setenv("TABLE_AWARE_INGESTION", "true")
+    monkeypatch.setenv("TABLE_PARSER_BACKEND", "pdfplumber_words")
+    monkeypatch.setattr(
+        TableAwareParser,
+        "_extract_with_pdfplumber_words",
+        lambda self, file_path, filename, max_pages: [
+            {
+                "table_id": "demo.pdf::table::p1::1",
+                "filename": filename,
+                "page_number": 1,
+                "table_index": 1,
+                "columns": ["Metric", "FY2022"],
+                "rows": [{"Metric": "Revenue", "FY2022": "100"}],
+                "csv_text": "Metric,FY2022\nRevenue,100",
+                "html": "<table></table>",
+                "parser_backend": "pdfplumber_words",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        TableAwareParser,
+        "_load_docling",
+        staticmethod(lambda: (_ for _ in ()).throw(AssertionError("docling should not be called"))),
+    )
+    monkeypatch.setattr(
+        TableAwareParser,
+        "_load_pdfplumber",
+        staticmethod(lambda: (_ for _ in ()).throw(AssertionError("pdfplumber matrix parser should not be called"))),
+    )
+
+    parser = TableAwareParser()
+    tables = parser.extract_tables("demo.pdf", "demo.pdf")
+
+    assert len(tables) == 1
+    assert tables[0]["parser_backend"] == "pdfplumber_words"
