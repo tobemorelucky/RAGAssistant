@@ -42,6 +42,7 @@ from schemas import (
     SessionListResponse,
     SessionMessagesResponse,
 )
+from table_store import TableStore
 from upload_jobs import DELETE_STEPS, delete_job_manager, upload_job_manager
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -51,6 +52,7 @@ UPLOAD_DIR = DATA_DIR / "documents"
 loader = DocumentLoader()
 parent_chunk_store = ParentChunkStore()
 document_page_store = DocumentPageStore()
+table_store = TableStore()
 milvus_manager = MilvusManager()
 milvus_writer = MilvusWriter(embedding_service=embedding_service, milvus_manager=milvus_manager)
 
@@ -250,6 +252,10 @@ def _process_upload_job(job_id: str, file_path: str, filename: str) -> None:
             document_page_store.delete_by_filename(filename)
         except Exception:
             pass
+        try:
+            table_store.delete_by_filename(filename)
+        except Exception:
+            pass
         upload_job_manager.complete_step(job_id, "cleanup", "旧版本清理完成")
 
         failed_step = "parse"
@@ -345,6 +351,11 @@ def _process_delete_job(job_id: str, filename: str) -> None:
         delete_job_manager.update_step(job_id, "parent_store", 30, "running", "正在删除 PostgreSQL 父级分块")
         parent_chunk_store.delete_by_filename(filename)
         delete_job_manager.complete_step(job_id, "parent_store", "父级分块已删除")
+
+        failed_step = "table_store"
+        delete_job_manager.update_step(job_id, "table_store", 20, "running", "正在删除结构化表格记录")
+        deleted_tables = table_store.delete_by_filename(filename)
+        delete_job_manager.complete_step(job_id, "table_store", f"结构化表格记录已删除：{deleted_tables} 条")
 
         # 完成摘要会由前端保留 3 秒，再自动从文档列表移除。
         delete_job_manager.complete_job(job_id, f"已删除 {filename}，向量数据 {deleted_count} 条")
@@ -460,7 +471,7 @@ async def delete_documents_async_batch(
             steps=DELETE_STEPS,
             current_step="prepare",
             message="等待删除",
-            completion_step="parent_store",
+            completion_step="table_store",
         )
         delete_job_manager.update_step(job["job_id"], "prepare", 1, "running", "删除任务已提交")
         background_tasks.add_task(_process_delete_job, job["job_id"], filename)
@@ -490,7 +501,7 @@ async def delete_document_async(
         steps=DELETE_STEPS,
         current_step="prepare",
         message="等待删除",
-        completion_step="parent_store",
+        completion_step="table_store",
     )
     delete_job_manager.update_step(job["job_id"], "prepare", 1, "running", "删除任务已提交")
     background_tasks.add_task(_process_delete_job, job["job_id"], filename)
@@ -539,6 +550,10 @@ async def upload_document(file: UploadFile = File(...), _: User = Depends(requir
             pass
         try:
             parent_chunk_store.delete_by_filename(filename)
+        except Exception:
+            pass
+        try:
+            table_store.delete_by_filename(filename)
         except Exception:
             pass
 
@@ -591,6 +606,7 @@ async def delete_document(filename: str, _: User = Depends(require_admin)):
         result = milvus_manager.delete(delete_expr)
         parent_chunk_store.delete_by_filename(filename)
         document_page_store.delete_by_filename(filename)
+        table_store.delete_by_filename(filename)
 
         return DocumentDeleteResponse(
             filename=filename,

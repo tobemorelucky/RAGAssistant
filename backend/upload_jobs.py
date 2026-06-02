@@ -13,18 +13,19 @@ JobStatus = Literal["pending", "running", "completed", "failed"]
 
 
 DEFAULT_STEPS = [
-    ("upload", "上传文件"),
-    ("cleanup", "清理旧数据"),
-    ("parse", "解析文档"),
-    ("parent_store", "写入父块存储"),
-    ("vector_store", "写入向量库"),
+    ("upload", "Upload file"),
+    ("cleanup", "Clean previous data"),
+    ("parse", "Parse document"),
+    ("parent_store", "Write parent chunks"),
+    ("vector_store", "Write vector store"),
 ]
 
 DELETE_STEPS = [
-    ("prepare", "准备删除"),
-    ("bm25", "清理 BM25 统计"),
-    ("milvus", "删除向量库数据"),
-    ("parent_store", "删除父块存储"),
+    ("prepare", "Prepare deletion"),
+    ("bm25", "Clean BM25 stats"),
+    ("milvus", "Delete vector data"),
+    ("parent_store", "Delete parent chunks"),
+    ("table_store", "Delete structured table records"),
 ]
 
 
@@ -45,7 +46,7 @@ class UploadJobManager:
         *,
         steps: list[tuple[str, str]] | None = None,
         current_step: str = "upload",
-        message: str = "等待处理",
+        message: str = "Waiting",
         completion_step: str = "vector_store",
     ) -> dict:
         steps = steps or DEFAULT_STEPS
@@ -122,7 +123,7 @@ class UploadJobManager:
     def complete_step(self, job_id: str, step_key: str, message: str = "") -> dict | None:
         return self.update_step(job_id, step_key, 100, "completed", message)
 
-    def complete_job(self, job_id: str, message: str = "处理完成") -> dict | None:
+    def complete_job(self, job_id: str, message: str = "Completed") -> dict | None:
         with self._lock:
             job = self._jobs.get(job_id)
             if not job:

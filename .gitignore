@@ -17,5 +17,3 @@ volumes/
 .DS_Store
 data/
 
-# test
-tests/

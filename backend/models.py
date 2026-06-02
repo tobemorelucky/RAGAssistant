@@ -3,7 +3,10 @@ from datetime import datetime
 from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from database import Base
+try:
+    from database import Base
+except ModuleNotFoundError:
+    from backend.database import Base
 
 
 class User(Base):
@@ -81,4 +84,25 @@ class DocumentPage(Base):
     page_numbers: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     page_years: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     page_metric_tokens: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class DocumentTable(Base):
+    __tablename__ = "document_tables"
+
+    table_id: Mapped[str] = mapped_column(String(512), primary_key=True)
+    filename: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    doc_name: Mapped[str] = mapped_column(String(255), default="", nullable=False, index=True)
+    file_type: Mapped[str] = mapped_column(String(50), default="", nullable=False)
+    file_path: Mapped[str] = mapped_column(String(1024), default="", nullable=False)
+    page_number: Mapped[int] = mapped_column(Integer, default=0, nullable=False, index=True)
+    table_index: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    title: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    caption: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    before_context: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    after_context: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    columns: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    rows: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    html: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    csv_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
