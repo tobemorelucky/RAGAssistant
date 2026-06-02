@@ -32,6 +32,22 @@ class TableAwareParser:
         return DocumentConverter
 
     @staticmethod
+    def _load_docling_pdf_format_option():
+        try:
+            from docling.document_converter import PdfFormatOption
+        except Exception:
+            return None
+        return PdfFormatOption
+
+    @staticmethod
+    def _load_docling_pipeline_options():
+        try:
+            from docling.datamodel.pipeline_options import PdfPipelineOptions
+        except Exception:
+            return None
+        return PdfPipelineOptions
+
+    @staticmethod
     def _load_pdfplumber():
         try:
             import pdfplumber
@@ -110,18 +126,89 @@ class TableAwareParser:
             body_rows.append(f"<tr>{cells}</tr>")
         return f"<table><thead><tr>{head}</tr></thead><tbody>{''.join(body_rows)}</tbody></table>"
 
-    def _extract_with_docling(self, file_path: str, filename: str) -> list[dict]:
+    @staticmethod
+    def _set_docling_option_if_present(options, names: list[str], value) -> bool:
+        for name in names:
+            if hasattr(options, name):
+                setattr(options, name, value)
+                return True
+        return False
+
+    def _build_docling_converter(self, *, docling_ocr: bool, timeout_seconds: int):
         document_converter_cls = self._load_docling()
         if document_converter_cls is None:
+            return None
+
+        pipeline_options_cls = self._load_docling_pipeline_options()
+        pdf_format_option_cls = self._load_docling_pdf_format_option()
+        pipeline_options = None
+        ocr_control_applied = docling_ocr
+
+        if pipeline_options_cls is not None:
+            try:
+                pipeline_options = pipeline_options_cls()
+                ocr_configured = self._set_docling_option_if_present(pipeline_options, ["do_ocr", "ocr_enabled"], docling_ocr)
+                ocr_control_applied = ocr_configured
+                timeout_configured = self._set_docling_option_if_present(
+                    pipeline_options,
+                    ["document_timeout", "timeout", "timeout_seconds"],
+                    timeout_seconds,
+                )
+                if not ocr_configured:
+                    logger.warning("docling pipeline options do not expose OCR switch; OCR behavior may use library defaults")
+                if not timeout_configured:
+                    logger.warning("docling pipeline options do not expose timeout setting; timeout config was ignored")
+            except Exception:
+                logger.exception("failed to initialize docling pipeline options")
+                pipeline_options = None
+
+        if not docling_ocr and not ocr_control_applied:
+            logger.warning("docling OCR disable setting could not be applied safely; skipping docling to avoid implicit OCR")
+            return None
+
+        if pdf_format_option_cls is not None and pipeline_options is not None:
+            try:
+                return document_converter_cls(format_options={"pdf": pdf_format_option_cls(pipeline_options=pipeline_options)})
+            except Exception:
+                logger.exception("failed to initialize docling converter with PdfFormatOption")
+
+        if pipeline_options is not None:
+            for kwargs in ({"pipeline_options": pipeline_options}, {"pdf_pipeline_options": pipeline_options}):
+                try:
+                    return document_converter_cls(**kwargs)
+                except TypeError:
+                    continue
+                except Exception:
+                    logger.exception("failed to initialize docling converter with pipeline options")
+                    break
+
+        try:
+            return document_converter_cls()
+        except Exception:
+            logger.exception("failed to initialize docling converter")
+            return None
+
+    def _extract_with_docling(
+        self,
+        file_path: str,
+        filename: str,
+        *,
+        docling_ocr: bool,
+        timeout_seconds: int,
+        max_pages: int | None,
+    ) -> list[dict]:
+        converter = self._build_docling_converter(docling_ocr=docling_ocr, timeout_seconds=timeout_seconds)
+        if converter is None:
             return []
 
         try:
-            converter = document_converter_cls()
             result = converter.convert(file_path)
             document = getattr(result, "document", result)
             tables = []
             for raw_table in getattr(document, "tables", []) or []:
                 page_number = int(getattr(raw_table, "page_no", 0) or getattr(raw_table, "page_number", 0) or 0)
+                if max_pages is not None and page_number > max_pages:
+                    continue
                 table_index = len(tables) + 1
                 data = getattr(raw_table, "data", None)
                 if hasattr(data, "to_dict"):
@@ -153,6 +240,7 @@ class TableAwareParser:
                         "rows": rows,
                         "html": self._build_html(columns, rows),
                         "csv_text": self._build_csv_text(columns, rows),
+                        "parser_backend": "docling",
                     }
                 )
             return tables
@@ -160,7 +248,7 @@ class TableAwareParser:
             logger.exception("docling table parsing failed filename=%s", filename)
             return []
 
-    def _extract_with_pdfplumber(self, file_path: str, filename: str) -> list[dict]:
+    def _extract_with_pdfplumber(self, file_path: str, filename: str, *, max_pages: int | None) -> list[dict]:
         pdfplumber = self._load_pdfplumber()
         if pdfplumber is None:
             return []
@@ -169,6 +257,8 @@ class TableAwareParser:
         try:
             with pdfplumber.open(file_path) as pdf:
                 for page_number, page in enumerate(getattr(pdf, "pages", []) or [], start=1):
+                    if max_pages is not None and page_number > max_pages:
+                        break
                     page_tables = page.extract_tables() or []
                     for table_index, matrix in enumerate(page_tables, start=1):
                         columns, rows = self._columns_and_rows_from_matrix(matrix)
@@ -191,6 +281,7 @@ class TableAwareParser:
                                 "rows": rows,
                                 "html": self._build_html(columns, rows),
                                 "csv_text": self._build_csv_text(columns, rows),
+                                "parser_backend": "pdfplumber",
                             }
                         )
             return tables
@@ -198,23 +289,65 @@ class TableAwareParser:
             logger.exception("pdfplumber table parsing failed filename=%s", filename)
             return []
 
-    def extract_tables(self, file_path: str, filename: str) -> List[dict]:
+    def extract_tables(
+        self,
+        file_path: str,
+        filename: str,
+        *,
+        parser_backend: str | None = None,
+        docling_ocr: bool | None = None,
+        timeout_seconds: int | None = None,
+        max_pages: int | None = None,
+    ) -> List[dict]:
         config = get_table_aware_config()
         if not config.table_aware_ingestion:
             return []
         if not (filename or "").lower().endswith(".pdf"):
             return []
 
-        tables = self._extract_with_docling(file_path, filename)
-        parser_backend = "docling"
-        if not tables:
-            tables = self._extract_with_pdfplumber(file_path, filename)
-            parser_backend = "pdfplumber" if tables else "none"
+        selected_backend = parser_backend or config.table_parser_backend
+        if selected_backend not in {"auto", "pdfplumber", "docling"}:
+            selected_backend = "auto"
+        effective_docling_ocr = config.table_docling_ocr if docling_ocr is None else bool(docling_ocr)
+        effective_timeout_seconds = config.table_docling_timeout_seconds if timeout_seconds is None else max(1, int(timeout_seconds))
+        effective_max_pages = None if max_pages is None else max(1, int(max_pages))
+
+        tables = []
+        resolved_backend = "none"
+
+        if selected_backend == "pdfplumber":
+            tables = self._extract_with_pdfplumber(file_path, filename, max_pages=effective_max_pages)
+            resolved_backend = "pdfplumber" if tables else "none"
+        elif selected_backend == "docling":
+            tables = self._extract_with_docling(
+                file_path,
+                filename,
+                docling_ocr=effective_docling_ocr,
+                timeout_seconds=effective_timeout_seconds,
+                max_pages=effective_max_pages,
+            )
+            resolved_backend = "docling" if tables else "none"
+        else:
+            tables = self._extract_with_docling(
+                file_path,
+                filename,
+                docling_ocr=effective_docling_ocr,
+                timeout_seconds=effective_timeout_seconds,
+                max_pages=effective_max_pages,
+            )
+            resolved_backend = "docling" if tables else "none"
+            if not tables:
+                tables = self._extract_with_pdfplumber(file_path, filename, max_pages=effective_max_pages)
+                resolved_backend = "pdfplumber" if tables else "none"
 
         logger.info(
-            "table parsing completed filename=%s tables=%s parser=%s",
+            "table parsing completed filename=%s tables=%s parser=%s selected_backend=%s docling_ocr=%s timeout_seconds=%s max_pages=%s",
             filename,
             len(tables),
-            parser_backend,
+            resolved_backend,
+            selected_backend,
+            effective_docling_ocr,
+            effective_timeout_seconds,
+            effective_max_pages,
         )
         return tables

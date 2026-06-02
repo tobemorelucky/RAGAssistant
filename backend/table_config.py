@@ -10,6 +10,9 @@ class TableAwareConfig:
     table_evidence_final_max: int
     table_full_fetch_enabled: bool
     enable_finance_formula_expansion: bool
+    table_parser_backend: str
+    table_docling_ocr: bool
+    table_docling_timeout_seconds: int
 
 
 def _parse_bool(value: str | None, default: bool) -> bool:
@@ -38,6 +41,13 @@ def _parse_retrieval_mode(value: str | None) -> str:
     return mode
 
 
+def _parse_table_parser_backend(value: str | None) -> str:
+    backend = (value or "auto").strip().lower()
+    if backend not in {"auto", "pdfplumber", "docling"}:
+        return "auto"
+    return backend
+
+
 def get_table_aware_config() -> TableAwareConfig:
     return TableAwareConfig(
         table_aware_ingestion=_parse_bool(os.getenv("TABLE_AWARE_INGESTION"), False),
@@ -46,4 +56,7 @@ def get_table_aware_config() -> TableAwareConfig:
         table_evidence_final_max=_parse_int(os.getenv("TABLE_EVIDENCE_FINAL_MAX"), 4, minimum=1),
         table_full_fetch_enabled=_parse_bool(os.getenv("TABLE_FULL_FETCH_ENABLED"), False),
         enable_finance_formula_expansion=_parse_bool(os.getenv("ENABLE_FINANCE_FORMULA_EXPANSION"), False),
+        table_parser_backend=_parse_table_parser_backend(os.getenv("TABLE_PARSER_BACKEND")),
+        table_docling_ocr=_parse_bool(os.getenv("TABLE_DOCLING_OCR"), False),
+        table_docling_timeout_seconds=_parse_int(os.getenv("TABLE_DOCLING_TIMEOUT_SECONDS"), 120, minimum=1),
     )

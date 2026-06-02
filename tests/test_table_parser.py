@@ -38,6 +38,7 @@ def test_extract_tables_returns_empty_when_disabled(monkeypatch):
 
 def test_extract_tables_returns_empty_when_dependencies_unavailable(monkeypatch):
     monkeypatch.setenv("TABLE_AWARE_INGESTION", "true")
+    monkeypatch.setenv("TABLE_PARSER_BACKEND", "auto")
     monkeypatch.setattr(TableAwareParser, "_load_docling", staticmethod(lambda: None))
     monkeypatch.setattr(TableAwareParser, "_load_pdfplumber", staticmethod(lambda: None))
 
@@ -76,8 +77,43 @@ def test_extract_tables_uses_pdfplumber_structure(monkeypatch):
     assert tables[0]["page_number"] == 1
     assert tables[0]["table_index"] == 1
     assert tables[0]["columns"] == ["Metric", "FY2022", "FY2021"]
+    assert tables[0]["parser_backend"] == "pdfplumber"
     assert tables[0]["rows"] == [
         {"Metric": "Revenue", "FY2022": "100", "FY2021": "90"},
         {"Metric": "Operating margin", "FY2022": "22%", "FY2021": "20%"},
     ]
     assert "Revenue" in tables[0]["csv_text"]
+
+
+def test_extract_tables_pdfplumber_backend_does_not_call_docling(monkeypatch):
+    monkeypatch.setenv("TABLE_AWARE_INGESTION", "true")
+    monkeypatch.setenv("TABLE_PARSER_BACKEND", "pdfplumber")
+    monkeypatch.setattr(
+        TableAwareParser,
+        "_load_docling",
+        staticmethod(lambda: (_ for _ in ()).throw(AssertionError("docling should not be called"))),
+    )
+    monkeypatch.setattr(
+        TableAwareParser,
+        "_load_pdfplumber",
+        staticmethod(lambda: _FakePdfPlumber([_FakePage([[]])])),
+    )
+
+    parser = TableAwareParser()
+
+    assert parser.extract_tables("demo.pdf", "demo.pdf") == []
+
+
+def test_extract_tables_docling_backend_returns_empty_when_docling_unavailable(monkeypatch):
+    monkeypatch.setenv("TABLE_AWARE_INGESTION", "true")
+    monkeypatch.setenv("TABLE_PARSER_BACKEND", "docling")
+    monkeypatch.setattr(TableAwareParser, "_load_docling", staticmethod(lambda: None))
+    monkeypatch.setattr(
+        TableAwareParser,
+        "_load_pdfplumber",
+        staticmethod(lambda: (_ for _ in ()).throw(AssertionError("pdfplumber should not be called"))),
+    )
+
+    parser = TableAwareParser()
+
+    assert parser.extract_tables("demo.pdf", "demo.pdf") == []
