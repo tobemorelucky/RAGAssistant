@@ -55,6 +55,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="鏄剧ず rejected 琛ㄦ牸鍊欓€夌殑棰勮",
     )
+    parser.add_argument(
+        "--show-normalized",
+        action="store_true",
+        help="鏄剧ず normalized 琛ㄦ牸鎽樿",
+    )
     parser.set_defaults(docling_ocr=None)
     return parser.parse_args(argv)
 
@@ -120,7 +125,7 @@ def resolve_runtime_config(args: argparse.Namespace) -> dict:
     }
 
 
-def _format_table_block(table: dict, max_rows: int) -> str:
+def _format_table_block(table: dict, max_rows: int, *, show_normalized: bool = False) -> str:
     preview_rows = list(table.get("rows") or [])[:max_rows]
     lines = [
         f"- parser_backend: {table.get('parser_backend', '')}",
@@ -140,6 +145,19 @@ def _format_table_block(table: dict, max_rows: int) -> str:
         f"  rows_preview({len(preview_rows)}): {preview_rows}",
         f"  csv_text_preview: {_preview_text(table.get('csv_text', ''))}",
     ]
+    if table.get("accepted", True) or show_normalized:
+        normalized_rows_preview = list(table.get("normalized_rows") or [])[:max_rows]
+        lines.extend(
+            [
+                f"  normalized: {table.get('normalized', False)}",
+                f"  normalization_level: {table.get('normalization_level', 'raw_only')}",
+                f"  normalized_title: {table.get('normalized_title', '')}",
+                f"  normalized_unit: {table.get('normalized_unit', '')}",
+                f"  normalized_columns: {table.get('normalized_columns', [])}",
+                f"  normalized_rows_preview({len(normalized_rows_preview)}): {normalized_rows_preview}",
+                f"  normalization_notes: {table.get('normalization_notes', [])}",
+            ]
+        )
     return "\n".join(lines)
 
 
@@ -151,6 +169,7 @@ def build_report(
     runtime_config: dict,
     *,
     show_rejected: bool = False,
+    show_normalized: bool = False,
 ) -> str:
     accepted_tables = [table for table in tables if table.get("accepted", True)]
     rejected_tables = [table for table in tables if not table.get("accepted", True)]
@@ -166,13 +185,13 @@ def build_report(
     ]
     for index, table in enumerate(accepted_tables[:max_tables], start=1):
         lines.append(f"accepted table #{index}")
-        lines.append(_format_table_block(table, max_rows))
+        lines.append(_format_table_block(table, max_rows, show_normalized=True))
     if len(accepted_tables) > max_tables:
         lines.append(f"... {len(accepted_tables) - max_tables} more accepted tables not shown")
     if show_rejected and rejected_tables:
         for index, table in enumerate(rejected_tables[:max_tables], start=1):
             lines.append(f"rejected table #{index}")
-            lines.append(_format_table_block(table, max_rows))
+            lines.append(_format_table_block(table, max_rows, show_normalized=show_normalized))
         if len(rejected_tables) > max_tables:
             lines.append(f"... {len(rejected_tables) - max_tables} more rejected tables not shown")
     return "\n".join(lines)
@@ -221,6 +240,7 @@ def main(argv: list[str] | None = None) -> int:
             max_rows=max_rows,
             runtime_config=runtime_config,
             show_rejected=args.show_rejected,
+            show_normalized=args.show_normalized,
         )
     )
     return 0

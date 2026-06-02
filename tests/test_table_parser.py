@@ -49,6 +49,7 @@ def test_extract_tables_returns_empty_when_dependencies_unavailable(monkeypatch)
 
 def test_extract_tables_uses_pdfplumber_structure(monkeypatch):
     monkeypatch.setenv("TABLE_AWARE_INGESTION", "true")
+    monkeypatch.setenv("TABLE_PARSER_BACKEND", "pdfplumber")
     monkeypatch.setattr(TableAwareParser, "_load_docling", staticmethod(lambda: None))
     monkeypatch.setattr(
         TableAwareParser,
