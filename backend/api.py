@@ -263,7 +263,7 @@ def _process_upload_job(job_id: str, file_path: str, filename: str) -> None:
         bundle = loader.load_document_bundle(file_path, filename)
         new_docs = bundle.get("chunks", [])
         page_docs = bundle.get("pages", [])
-        table_docs = bundle.get("tables", [])
+        tables = bundle.get("tables", [])
         if not new_docs:
             raise ValueError("文档处理失败，未能提取内容")
 
@@ -289,13 +289,13 @@ def _process_upload_job(job_id: str, file_path: str, filename: str) -> None:
         document_page_store.upsert_pages(page_docs)
         table_count = 0
         try:
-            table_count = table_store.upsert_tables(table_docs)
+            table_count = table_store.upsert_tables(tables)
         except Exception:
             logger.exception("table store upsert failed filename=%s", filename)
         logger.info(
             "upload table extraction filename=%s parsed_tables=%s stored_tables=%s",
             filename,
-            len(table_docs),
+            len(tables),
             table_count,
         )
         upload_job_manager.complete_step(job_id, "parent_store", f"父级分块已入库：{len(parent_docs)} 个")
@@ -578,7 +578,7 @@ async def upload_document(file: UploadFile = File(...), _: User = Depends(requir
             bundle = loader.load_document_bundle(str(file_path), filename)
             new_docs = bundle.get("chunks", [])
             page_docs = bundle.get("pages", [])
-            table_docs = bundle.get("tables", [])
+            tables = bundle.get("tables", [])
         except Exception as doc_err:
             raise HTTPException(status_code=500, detail=f"文档处理失败: {doc_err}")
 
@@ -593,14 +593,14 @@ async def upload_document(file: UploadFile = File(...), _: User = Depends(requir
         parent_chunk_store.upsert_documents(parent_docs)
         document_page_store.upsert_pages(page_docs)
         try:
-            table_store.upsert_tables(table_docs)
+            table_store.upsert_tables(tables)
         except Exception:
             logger.exception("table store upsert failed filename=%s", filename)
         milvus_writer.write_documents(leaf_docs)
         logger.info(
             "upload table extraction filename=%s parsed_tables=%s",
             filename,
-            len(table_docs),
+            len(tables),
         )
 
         return DocumentUploadResponse(
