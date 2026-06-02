@@ -50,6 +50,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="最多解析前多少页，默认不限制",
     )
+    parser.add_argument(
+        "--show-rejected",
+        action="store_true",
+        help="鏄剧ず rejected 琛ㄦ牸鍊欓€夌殑棰勮",
+    )
     parser.set_defaults(docling_ocr=None)
     return parser.parse_args(argv)
 
@@ -119,6 +124,13 @@ def _format_table_block(table: dict, max_rows: int) -> str:
     preview_rows = list(table.get("rows") or [])[:max_rows]
     lines = [
         f"- parser_backend: {table.get('parser_backend', '')}",
+        f"  accepted: {table.get('accepted', True)}",
+        f"  quality_score: {table.get('quality_score', 0.0)}",
+        f"  reject_reason: {table.get('reject_reason', '')}",
+        f"  numeric_cell_ratio: {table.get('numeric_cell_ratio', 0.0)}",
+        f"  non_empty_cell_ratio: {table.get('non_empty_cell_ratio', 0.0)}",
+        f"  effective_col_count: {table.get('effective_col_count', 0)}",
+        f"  data_row_count: {table.get('data_row_count', 0)}",
         f"  page_number: {table.get('page_number', '')}",
         f"  table_index: {table.get('table_index', '')}",
         f"  table_id: {table.get('table_id', '')}",
@@ -131,20 +143,38 @@ def _format_table_block(table: dict, max_rows: int) -> str:
     return "\n".join(lines)
 
 
-def build_report(file_path: Path, tables: list[dict], max_tables: int, max_rows: int, runtime_config: dict) -> str:
+def build_report(
+    file_path: Path,
+    tables: list[dict],
+    max_tables: int,
+    max_rows: int,
+    runtime_config: dict,
+    *,
+    show_rejected: bool = False,
+) -> str:
+    accepted_tables = [table for table in tables if table.get("accepted", True)]
+    rejected_tables = [table for table in tables if not table.get("accepted", True)]
     lines = [
         f"filename: {file_path.name}",
         f"backend: {runtime_config.get('backend', 'auto')}",
         f"docling_ocr: {runtime_config.get('docling_ocr', False)}",
         f"timeout_seconds: {runtime_config.get('timeout_seconds', 120)}",
         f"max_pages: {runtime_config.get('max_pages')}",
-        f"tables found: {len(tables)}",
+        f"raw candidates: {len(tables)}",
+        f"accepted tables: {len(accepted_tables)}",
+        f"rejected tables: {len(rejected_tables)}",
     ]
-    for index, table in enumerate(tables[:max_tables], start=1):
-        lines.append(f"table #{index}")
+    for index, table in enumerate(accepted_tables[:max_tables], start=1):
+        lines.append(f"accepted table #{index}")
         lines.append(_format_table_block(table, max_rows))
-    if len(tables) > max_tables:
-        lines.append(f"... {len(tables) - max_tables} more tables not shown")
+    if len(accepted_tables) > max_tables:
+        lines.append(f"... {len(accepted_tables) - max_tables} more accepted tables not shown")
+    if show_rejected and rejected_tables:
+        for index, table in enumerate(rejected_tables[:max_tables], start=1):
+            lines.append(f"rejected table #{index}")
+            lines.append(_format_table_block(table, max_rows))
+        if len(rejected_tables) > max_tables:
+            lines.append(f"... {len(rejected_tables) - max_tables} more rejected tables not shown")
     return "\n".join(lines)
 
 
@@ -177,12 +207,22 @@ def main(argv: list[str] | None = None) -> int:
             docling_ocr=runtime_config["docling_ocr"],
             timeout_seconds=runtime_config["timeout_seconds"],
             max_pages=runtime_config["max_pages"],
+            include_rejected=True,
         )
     except Exception as exc:
         print(f"表格解析失败: {exc}", file=sys.stderr)
         return 1
 
-    print(build_report(file_path, tables, max_tables=max_tables, max_rows=max_rows, runtime_config=runtime_config))
+    print(
+        build_report(
+            file_path,
+            tables,
+            max_tables=max_tables,
+            max_rows=max_rows,
+            runtime_config=runtime_config,
+            show_rejected=args.show_rejected,
+        )
+    )
     return 0
 
 

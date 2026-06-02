@@ -294,6 +294,21 @@ class TableAwareParser:
     def _extract_with_pdfplumber_words(self, file_path: str, filename: str, *, max_pages: int | None) -> list[dict]:
         return reconstruct_tables_from_words(file_path, filename, max_pages=max_pages)
 
+    def _extract_with_pdfplumber_words_debug(
+        self,
+        file_path: str,
+        filename: str,
+        *,
+        max_pages: int | None,
+        include_rejected: bool,
+    ) -> list[dict]:
+        return reconstruct_tables_from_words(
+            file_path,
+            filename,
+            max_pages=max_pages,
+            include_rejected=include_rejected,
+        )
+
     def extract_tables(
         self,
         file_path: str,
@@ -303,6 +318,7 @@ class TableAwareParser:
         docling_ocr: bool | None = None,
         timeout_seconds: int | None = None,
         max_pages: int | None = None,
+        include_rejected: bool = False,
     ) -> List[dict]:
         config = get_table_aware_config()
         if not config.table_aware_ingestion:
@@ -324,7 +340,12 @@ class TableAwareParser:
             tables = self._extract_with_pdfplumber(file_path, filename, max_pages=effective_max_pages)
             resolved_backend = "pdfplumber" if tables else "none"
         elif selected_backend == "pdfplumber_words":
-            tables = self._extract_with_pdfplumber_words(file_path, filename, max_pages=effective_max_pages)
+            tables = self._extract_with_pdfplumber_words_debug(
+                file_path,
+                filename,
+                max_pages=effective_max_pages,
+                include_rejected=include_rejected,
+            )
             resolved_backend = "pdfplumber_words" if tables else "none"
         elif selected_backend == "docling":
             tables = self._extract_with_docling(

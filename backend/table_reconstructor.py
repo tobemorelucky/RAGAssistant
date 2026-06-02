@@ -38,6 +38,8 @@ _METRIC_HINTS = {
 }
 
 _YEAR_PATTERN = re.compile(r"\b(?:fy(?:19|20)?\d{2}|(?:19|20)\d{2})\b", re.IGNORECASE)
+_NUMERIC_PATTERN = re.compile(r"^\(?-?[$€£]?\d[\d,]*(?:\.\d+)?%?\)?$")
+_BULLET_PATTERN = re.compile(r"^(?:[-*•·▪◦]|\(\w\)|\d+[.)])\s*")
 
 
 def _load_pdfplumber():
@@ -228,7 +230,88 @@ def _build_html(columns: list[str], rows: list[dict]) -> str:
     return f"<table><thead><tr>{head}</tr></thead><tbody>{''.join(body_rows)}</tbody></table>"
 
 
-def _extract_page_tables(page, filename: str, page_number: int) -> list[dict]:
+def _is_numeric_like(text: str) -> bool:
+    value = sanitize_text(text).strip()
+    if not value:
+        return False
+    return bool(_NUMERIC_PATTERN.match(value))
+
+
+def _word_count(text: str) -> int:
+    return len(re.findall(r"[A-Za-z]+", sanitize_text(text)))
+
+
+def _evaluate_candidate(matrix: list[list[str]], columns: list[str], rows: list[dict]) -> dict:
+    data_row_count = len(rows)
+    effective_col_count = sum(1 for column in columns if any((row.get(column) or "").strip() for row in rows)) or len(columns)
+    total_cells = max(1, sum(len(row) for row in matrix))
+    non_empty_cells = sum(1 for row in matrix for cell in row if sanitize_text(cell).strip())
+    numeric_cells = sum(1 for row in matrix for cell in row if _is_numeric_like(cell))
+    non_empty_cell_ratio = round(non_empty_cells / total_cells, 4)
+    numeric_cell_ratio = round(numeric_cells / max(1, non_empty_cells), 4)
+
+    first_column_key = columns[0] if columns else ""
+    first_column_values = [(row.get(first_column_key) or "").strip() for row in rows] if first_column_key else []
+    bullet_ratio = (
+        sum(1 for value in first_column_values if _BULLET_PATTERN.match(value)) / max(1, len(first_column_values))
+        if first_column_values
+        else 0.0
+    )
+    average_words_per_cell = (
+        sum(_word_count(cell) for row in matrix for cell in row if sanitize_text(cell).strip()) / max(1, non_empty_cells)
+    )
+    header_joined = " ".join(columns).lower()
+    plain_header_words = [token for token in re.findall(r"[a-zA-Z]+", header_joined) if token not in _METRIC_HINTS]
+    header_year_count = len(_YEAR_PATTERN.findall(header_joined))
+
+    reject_reason = ""
+    if bullet_ratio >= 0.5 and numeric_cell_ratio < 0.15:
+        reject_reason = "bullet_list_like"
+    elif (average_words_per_cell >= 3.2 and numeric_cell_ratio < 0.12) or (
+        numeric_cell_ratio < 0.05 and data_row_count <= 1 and effective_col_count >= 6
+    ):
+        reject_reason = "paragraph_like"
+    elif effective_col_count >= 8 and numeric_cell_ratio < 0.15 and len(plain_header_words) >= max(4, effective_col_count - 1):
+        reject_reason = "too_many_text_columns"
+    elif effective_col_count < 2:
+        reject_reason = "too_few_columns"
+    elif data_row_count < 2:
+        reject_reason = "too_few_rows"
+    elif non_empty_cell_ratio < 0.45:
+        reject_reason = "mostly_empty"
+    elif numeric_cell_ratio < 0.2 and header_year_count == 0:
+        reject_reason = "low_numeric_density"
+
+    quality_score = round(
+        min(
+            1.0,
+            max(
+                0.0,
+                0.35
+                + min(0.25, numeric_cell_ratio * 0.45)
+                + min(0.2, non_empty_cell_ratio * 0.2)
+                + min(0.1, effective_col_count * 0.02)
+                + min(0.1, data_row_count * 0.025)
+                + min(0.1, header_year_count * 0.05),
+            ),
+        ),
+        4,
+    )
+    if reject_reason:
+        quality_score = round(max(0.0, quality_score - 0.45), 4)
+
+    return {
+        "accepted": not reject_reason,
+        "quality_score": quality_score,
+        "reject_reason": reject_reason,
+        "numeric_cell_ratio": numeric_cell_ratio,
+        "non_empty_cell_ratio": non_empty_cell_ratio,
+        "effective_col_count": int(effective_col_count),
+        "data_row_count": int(data_row_count),
+    }
+
+
+def _extract_page_tables(page, filename: str, page_number: int, *, include_rejected: bool) -> list[dict]:
     raw_words = page.extract_words() or []
     words = [item for item in (_normalize_word(word) for word in raw_words) if item]
     row_clusters = _cluster_rows(words)
@@ -241,30 +324,37 @@ def _extract_page_tables(page, filename: str, page_number: int) -> list[dict]:
         columns, rows = _matrix_to_columns_and_rows(matrix)
         if not columns or not rows:
             continue
-        tables.append(
-            {
-                "table_id": f"{filename}::table::p{page_number}::{table_index}",
-                "filename": filename,
-                "doc_name": os.path.splitext(filename)[0],
-                "file_type": "PDF",
-                "file_path": "",
-                "page_number": page_number,
-                "table_index": table_index,
-                "title": "",
-                "caption": "",
-                "before_context": "",
-                "after_context": "",
-                "columns": columns,
-                "rows": rows,
-                "csv_text": _build_csv_text(columns, rows),
-                "html": _build_html(columns, rows),
-                "parser_backend": "pdfplumber_words",
-            }
-        )
+        candidate = {
+            "table_id": f"{filename}::table::p{page_number}::{table_index}",
+            "filename": filename,
+            "doc_name": os.path.splitext(filename)[0],
+            "file_type": "PDF",
+            "file_path": "",
+            "page_number": page_number,
+            "table_index": table_index,
+            "title": "",
+            "caption": "",
+            "before_context": "",
+            "after_context": "",
+            "columns": columns,
+            "rows": rows,
+            "csv_text": _build_csv_text(columns, rows),
+            "html": _build_html(columns, rows),
+            "parser_backend": "pdfplumber_words",
+        }
+        candidate.update(_evaluate_candidate(matrix, columns, rows))
+        if candidate["accepted"] or include_rejected:
+            tables.append(candidate)
     return tables
 
 
-def reconstruct_tables_from_words(file_path: str, filename: str, max_pages: int | None = None) -> list[dict]:
+def reconstruct_tables_from_words(
+    file_path: str,
+    filename: str,
+    max_pages: int | None = None,
+    *,
+    include_rejected: bool = False,
+) -> list[dict]:
     pdfplumber = _load_pdfplumber()
     if pdfplumber is None:
         return []
@@ -276,7 +366,7 @@ def reconstruct_tables_from_words(file_path: str, filename: str, max_pages: int 
             for page_number, page in enumerate(getattr(pdf, "pages", []) or [], start=1):
                 if normalized_max_pages is not None and page_number > normalized_max_pages:
                     break
-                tables.extend(_extract_page_tables(page, filename, page_number))
+                tables.extend(_extract_page_tables(page, filename, page_number, include_rejected=include_rejected))
     except Exception:
         logger.exception("pdfplumber words reconstruction failed filename=%s", filename)
         return []

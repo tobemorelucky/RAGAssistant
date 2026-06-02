@@ -124,8 +124,8 @@ def test_extract_tables_pdfplumber_words_backend(monkeypatch):
     monkeypatch.setenv("TABLE_PARSER_BACKEND", "pdfplumber_words")
     monkeypatch.setattr(
         TableAwareParser,
-        "_extract_with_pdfplumber_words",
-        lambda self, file_path, filename, max_pages: [
+        "_extract_with_pdfplumber_words_debug",
+        lambda self, file_path, filename, max_pages, include_rejected: [
             {
                 "table_id": "demo.pdf::table::p1::1",
                 "filename": filename,
@@ -155,3 +155,26 @@ def test_extract_tables_pdfplumber_words_backend(monkeypatch):
 
     assert len(tables) == 1
     assert tables[0]["parser_backend"] == "pdfplumber_words"
+
+
+def test_extract_tables_pdfplumber_words_include_rejected_flag(monkeypatch):
+    monkeypatch.setenv("TABLE_AWARE_INGESTION", "true")
+    monkeypatch.setenv("TABLE_PARSER_BACKEND", "pdfplumber_words")
+    monkeypatch.setattr(
+        TableAwareParser,
+        "_extract_with_pdfplumber_words_debug",
+        lambda self, file_path, filename, max_pages, include_rejected: [
+            {"table_id": "accepted", "parser_backend": "pdfplumber_words", "accepted": True},
+            {"table_id": "rejected", "parser_backend": "pdfplumber_words", "accepted": False},
+        ]
+        if include_rejected
+        else [{"table_id": "accepted", "parser_backend": "pdfplumber_words", "accepted": True}],
+    )
+
+    parser = TableAwareParser()
+
+    accepted_only = parser.extract_tables("demo.pdf", "demo.pdf")
+    with_rejected = parser.extract_tables("demo.pdf", "demo.pdf", include_rejected=True)
+
+    assert [item["table_id"] for item in accepted_only] == ["accepted"]
+    assert [item["table_id"] for item in with_rejected] == ["accepted", "rejected"]
