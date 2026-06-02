@@ -1,5 +1,6 @@
 """Document loading and hierarchical chunking utilities."""
 
+import logging
 import os
 import re
 from typing import Dict, List
@@ -12,7 +13,15 @@ from langchain_community.document_loaders import (
     UnstructuredExcelLoader,
 )
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from text_sanitizer import sanitize_text
+
+try:
+    from table_parser import TableAwareParser
+    from text_sanitizer import sanitize_text
+except ModuleNotFoundError:
+    from backend.table_parser import TableAwareParser
+    from backend.text_sanitizer import sanitize_text
+
+logger = logging.getLogger(__name__)
 
 
 class DocumentLoader:
@@ -46,6 +55,7 @@ class DocumentLoader:
             add_start_index=True,
             separators=separators,
         )
+        self._table_parser = TableAwareParser()
 
     @staticmethod
     def _build_chunk_id(filename: str, page_number: int, level: int, index: int) -> str:
@@ -211,7 +221,14 @@ class DocumentLoader:
                         ],
                     }
                 )
-            return {"chunks": documents, "pages": pages}
+            tables = []
+            if doc_type == "PDF":
+                try:
+                    tables = self._table_parser.extract_tables(file_path, filename)
+                except Exception:
+                    logger.exception("table parsing failed filename=%s", filename)
+                    tables = []
+            return {"chunks": documents, "pages": pages, "tables": tables}
         except Exception as e:
             raise Exception(f"Failed to process document: {str(e)}")
 

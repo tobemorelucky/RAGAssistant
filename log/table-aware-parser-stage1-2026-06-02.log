@@ -1,0 +1,28 @@
+2026-06-02
+
+Summary:
+- Added an optional PDF table parser for future table-aware ingestion.
+- Default behavior remains unchanged because TABLE_AWARE_INGESTION is disabled by default.
+
+Files changed:
+- backend/table_parser.py
+- backend/document_loader.py
+- backend/api.py
+- tests/test_table_parser.py
+
+Behavior:
+- Table parsing only runs for PDF files when TABLE_AWARE_INGESTION=true.
+- Parsing failures do not fail document upload.
+- If Docling is unavailable, the parser falls back to pdfplumber.
+- If no parser dependency is available, or no tables are found, the parser returns [].
+- Structured table payload includes at least page_number, table_index, columns, and rows.
+- Upload logs now include parsed/stored table counts per file.
+
+Validation:
+- conda run -n rag python -m compileall backend
+- python -m pytest tests/test_table_config.py tests/test_table_store.py tests/test_table_parser.py
+
+Notes:
+- No Milvus schema changes.
+- No retrieval logic changes.
+- No finance_experimental deletion.

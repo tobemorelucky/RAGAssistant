@@ -1,0 +1,83 @@
+from backend.table_parser import TableAwareParser
+
+
+class _FakePage:
+    def __init__(self, tables):
+        self._tables = tables
+
+    def extract_tables(self):
+        return self._tables
+
+
+class _FakePdf:
+    def __init__(self, pages):
+        self.pages = pages
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FakePdfPlumber:
+    def __init__(self, pages):
+        self._pages = pages
+
+    def open(self, _file_path):
+        return _FakePdf(self._pages)
+
+
+def test_extract_tables_returns_empty_when_disabled(monkeypatch):
+    monkeypatch.setenv("TABLE_AWARE_INGESTION", "false")
+
+    parser = TableAwareParser()
+
+    assert parser.extract_tables("demo.pdf", "demo.pdf") == []
+
+
+def test_extract_tables_returns_empty_when_dependencies_unavailable(monkeypatch):
+    monkeypatch.setenv("TABLE_AWARE_INGESTION", "true")
+    monkeypatch.setattr(TableAwareParser, "_load_docling", staticmethod(lambda: None))
+    monkeypatch.setattr(TableAwareParser, "_load_pdfplumber", staticmethod(lambda: None))
+
+    parser = TableAwareParser()
+
+    assert parser.extract_tables("demo.pdf", "demo.pdf") == []
+
+
+def test_extract_tables_uses_pdfplumber_structure(monkeypatch):
+    monkeypatch.setenv("TABLE_AWARE_INGESTION", "true")
+    monkeypatch.setattr(TableAwareParser, "_load_docling", staticmethod(lambda: None))
+    monkeypatch.setattr(
+        TableAwareParser,
+        "_load_pdfplumber",
+        staticmethod(
+            lambda: _FakePdfPlumber(
+                [
+                    _FakePage(
+                        [
+                            [
+                                ["Metric", "FY2022", "FY2021"],
+                                ["Revenue", "100", "90"],
+                                ["Operating margin", "22%", "20%"],
+                            ]
+                        ]
+                    )
+                ]
+            )
+        ),
+    )
+
+    parser = TableAwareParser()
+    tables = parser.extract_tables("demo.pdf", "demo.pdf")
+
+    assert len(tables) == 1
+    assert tables[0]["page_number"] == 1
+    assert tables[0]["table_index"] == 1
+    assert tables[0]["columns"] == ["Metric", "FY2022", "FY2021"]
+    assert tables[0]["rows"] == [
+        {"Metric": "Revenue", "FY2022": "100", "FY2021": "90"},
+        {"Metric": "Operating margin", "FY2022": "22%", "FY2021": "20%"},
+    ]
+    assert "Revenue" in tables[0]["csv_text"]
