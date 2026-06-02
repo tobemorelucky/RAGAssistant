@@ -78,6 +78,11 @@ def _parse_int(value: str | None, default: int) -> int:
 
 
 def _parse_retrieval_mode(value: str | None) -> str:
+    # Deprecated experimental FinanceBench path.
+    # Kept for comparison and debugging only.
+    # Do not use as the default production retrieval path.
+    # New table-aware RAG work should be implemented behind TABLE_AWARE_* feature flags
+    # and must preserve baseline behavior when TABLE_AWARE_RETRIEVAL=off.
     mode = (value or "baseline").strip().lower()
     if mode not in {"baseline", "finance_experimental"}:
         return "baseline"

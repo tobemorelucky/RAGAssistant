@@ -147,6 +147,31 @@ FINANCE_RAG_ENABLE_PAGE_MERGE=true
 - `MILVUS_SEARCH_EF` 会自动与实际搜索 `k` 协调，避免 `ef <= k` 导致的 Milvus 检索报错。
 - `RAG_RETRIEVAL_MODE=baseline` 是当前推荐默认值。
 
+Table-Aware RAG 预留开关：
+
+```env
+# Table-Aware RAG feature flags
+# First-stage default: disabled, no behavior change.
+TABLE_AWARE_INGESTION=false
+TABLE_AWARE_RETRIEVAL=off
+TABLE_EVIDENCE_TOP_K=20
+TABLE_EVIDENCE_FINAL_MAX=4
+TABLE_FULL_FETCH_ENABLED=false
+ENABLE_FINANCE_FORMULA_EXPANSION=false
+```
+
+说明：
+
+- `TABLE_AWARE_INGESTION`
+  - 是否在文档入库阶段解析和索引表格证据。
+  - 第一阶段安全 commit 默认关闭，不改变现有行为。
+- `TABLE_AWARE_RETRIEVAL`
+  - `off`：完全关闭 table-aware retrieval
+  - `auto`：仅当问题看起来像表格 / 数值 / 财务问题时启用
+  - `force`：总是纳入表格证据候选，主要用于调试
+
+当前第一阶段 commit 只新增配置开关，不解析表格，不修改 Milvus schema，也不改变 baseline 检索行为。
+
 ### 3. 启动依赖服务
 
 ```bash
