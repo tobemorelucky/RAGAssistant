@@ -204,6 +204,66 @@ def test_raw_row_does_not_pick_title_line_when_normalized_rows_have_internal_sou
     assert "Values Sequence: 3,909 | 3,673 | 14,544 | 14,694" in row_doc["text"]
 
 
+def test_values_sequence_prefers_numbers_from_raw_row():
+    docs = build_table_evidence_docs(
+        [
+            {
+                "accepted": True,
+                "table_id": "demo.pdf::table::p11::1",
+                "filename": "demo.pdf",
+                "page_number": 11,
+                "normalized_columns": [
+                    "Metric",
+                    "Three Months",
+                    "Ended June 30,",
+                    "Twelve Months",
+                    "Ended June 30,_2",
+                ],
+                "normalized_rows": [
+                    {
+                        "Metric": "Net sales",
+                        "Three Months": "3,909",
+                        "Ended June 30,": "14,694",
+                        "Twelve Months": "14,544",
+                        "Ended June 30,_2": "14,694",
+                        "_raw_line": "Net sales 3,909 3,673 14,544 14,694",
+                    }
+                ],
+            }
+        ]
+    )
+
+    row_doc = docs[1]
+    assert "Values Sequence: 3,909 | 3,673 | 14,544 | 14,694" in row_doc["text"]
+
+
+def test_values_sequence_supports_parenthesized_numbers_from_raw_row():
+    docs = build_table_evidence_docs(
+        [
+            {
+                "accepted": True,
+                "table_id": "demo.pdf::table::p12::1",
+                "filename": "demo.pdf",
+                "page_number": 12,
+                "normalized_columns": ["Metric", "2023", "2022", "FY2023", "FY2022"],
+                "normalized_rows": [
+                    {
+                        "Metric": "Cost of sales",
+                        "2023": "(3,115)",
+                        "2022": "(2,951)",
+                        "FY2023": "(11,724)",
+                        "FY2022": "(11,969)",
+                        "_raw_line": "Cost of sales (3,115) (2,951) (11,724) (11,969)",
+                    }
+                ],
+            }
+        ]
+    )
+
+    row_doc = docs[1]
+    assert "Values Sequence: (3,115) | (2,951) | (11,724) | (11,969)" in row_doc["text"]
+
+
 def test_metric_matching_does_not_cross_match_to_different_row():
     docs = build_table_evidence_docs(
         [

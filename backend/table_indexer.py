@@ -1,6 +1,7 @@
 """将已抽取的表格转换为仅用于调试预览的文本证据。"""
 
 from __future__ import annotations
+import re
 from typing import Iterable
 
 try:
@@ -71,6 +72,14 @@ def _extract_value_sequence(row: dict, columns: list[str]) -> str:
         value = _clean_text(row.get(column, ""))
         if value:
             values.append(value)
+    return " | ".join(values)
+
+
+_RAW_VALUE_PATTERN = re.compile(r"\(\d[\d,]*(?:\.\d+)?\)|\d[\d,]*(?:\.\d+)?|[—-]")
+
+
+def _extract_value_sequence_from_raw_row(raw_row: str) -> str:
+    values = [match.group(0) for match in _RAW_VALUE_PATTERN.finditer(_clean_text(raw_row))]
     return " | ".join(values)
 
 
@@ -172,7 +181,7 @@ def _build_row_text(table: dict, row: dict, row_index: int, columns: list[str]) 
     title = _get_table_title(table)
     row_values = _stringify_row(row, columns)
     raw_row = _lookup_raw_row(table, row, columns)
-    values_sequence = _extract_value_sequence(row, columns)
+    values_sequence = _extract_value_sequence_from_raw_row(raw_row) if raw_row else _extract_value_sequence(row, columns)
     parts = [
         f"Document: {filename}",
         f"Page: {page_number}",
