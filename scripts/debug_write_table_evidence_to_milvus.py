@@ -8,6 +8,11 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+BACKEND = ROOT / "backend"
+for path in (ROOT, BACKEND):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
 def _configure_console_encoding() -> None:
     for stream in (sys.stdout, sys.stderr):

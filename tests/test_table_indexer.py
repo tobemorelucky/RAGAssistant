@@ -17,12 +17,19 @@ def test_normalized_table_generates_summary_and_table_rows():
             "accepted": True,
             "table_id": "demo.pdf::table::p3::1",
             "filename": "demo.pdf",
+            "file_type": "PDF",
+            "file_path": "data/documents/demo.pdf",
             "page_number": 3,
             "normalized_title": "Condensed Consolidated Statements of Income",
             "normalized_columns": ["Metric", "2023", "2022"],
             "normalized_rows": [
                 {"Metric": "Revenue", "2023": "120", "2022": "100"},
                 {"Metric": "Operating margin", "2023": "20%", "2022": "18%"},
+            ],
+            "raw_matrix": [
+                ["Metric", "2023", "2022"],
+                ["Revenue", "120", "100"],
+                ["Operating margin", "20%", "18%"],
             ],
             "raw_lines": ["Revenue 120 100", "Operating margin 20% 18%"],
         }
@@ -33,12 +40,18 @@ def test_normalized_table_generates_summary_and_table_rows():
     assert [doc["evidence_type"] for doc in docs] == ["table_summary", "table_row", "table_row"]
     assert docs[0]["chunk_id"] == "demo.pdf::table::p3::1::summary"
     assert docs[1]["chunk_id"] == "demo.pdf::table::p3::1::row::row_1"
+    assert docs[0]["file_type"] == "PDF"
+    assert docs[0]["file_path"] == "data/documents/demo.pdf"
+    assert docs[0]["chunk_idx"] == 0
     assert docs[0]["page_number"] == 3
     assert "Document: demo.pdf" in docs[0]["text"]
     assert "Columns: Metric | 2023 | 2022" in docs[0]["text"]
     assert "Revenue" in docs[1]["text"]
     assert docs[1]["row_id"] == "row_1"
     assert docs[1]["text"].index("Row Values:") < docs[1]["text"].index("Columns:")
+    assert "Raw Row: Revenue 120 100" in docs[1]["text"]
+    assert "Values Sequence: 120 | 100" in docs[1]["text"]
+    assert docs[1]["text"].index("Raw Row:") < docs[1]["text"].index("Columns:")
 
 
 def test_raw_only_table_generates_summary_and_table_raw():
@@ -47,6 +60,8 @@ def test_raw_only_table_generates_summary_and_table_raw():
             "accepted": True,
             "table_id": "demo.pdf::table::p4::1",
             "filename": "demo.pdf",
+            "file_type": "PDF",
+            "file_path": "data/documents/demo.pdf",
             "page_number": 4,
             "title": "Conference Call Participant List",
             "columns": ["Name", "Role"],
@@ -71,6 +86,8 @@ def test_non_financial_table_still_generates_evidence_when_accepted():
             "accepted": True,
             "table_id": "call.pdf::table::p2::1",
             "filename": "call.pdf",
+            "file_type": "PDF",
+            "file_path": "data/documents/call.pdf",
             "page_number": 2,
             "title": "Conference Call Participants",
             "columns": ["Name", "Role"],
@@ -101,6 +118,54 @@ def test_rejected_tables_are_not_indexed():
     )
 
     assert docs == []
+
+
+def test_table_evidence_docs_include_milvus_writer_required_fields():
+    docs = build_table_evidence_docs(
+        [
+            {
+                "accepted": True,
+                "table_id": "demo.pdf::table::p1::1",
+                "filename": "demo.pdf",
+                "page_number": 1,
+                "columns": ["Metric", "Value"],
+                "rows": [{"Metric": "Revenue", "Value": "100"}],
+                "raw_lines": ["Revenue 100"],
+            }
+        ]
+    )
+
+    for doc in docs:
+        assert "filename" in doc
+        assert "file_type" in doc
+        assert "file_path" in doc
+        assert "chunk_idx" in doc
+    assert docs[0]["file_type"] == "PDF"
+    assert docs[0]["file_path"] == ""
+    assert docs[0]["chunk_idx"] == 0
+
+
+def test_table_row_without_raw_matrix_or_raw_lines_does_not_fail():
+    docs = build_table_evidence_docs(
+        [
+            {
+                "accepted": True,
+                "table_id": "demo.pdf::table::p6::1",
+                "filename": "demo.pdf",
+                "page_number": 6,
+                "normalized_columns": ["Metric", "Q1", "Q2"],
+                "normalized_rows": [
+                    {"Metric": "Net sales", "Q1": "3,909", "Q2": "3,673"},
+                ],
+            }
+        ]
+    )
+
+    row_doc = docs[1]
+    assert row_doc["evidence_type"] == "table_row"
+    assert "Row Values:" in row_doc["text"]
+    assert "Values Sequence: 3,909 | 3,673" in row_doc["text"]
+    assert "Columns: Metric | Q1 | Q2" in row_doc["text"]
 
 
 def test_debug_table_evidence_parse_args_support_preview_and_output_json():

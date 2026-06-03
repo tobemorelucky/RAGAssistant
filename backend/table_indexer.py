@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Iterable
 
 try:
@@ -57,6 +58,37 @@ def _preview_items(items: Iterable[str], limit: int) -> str:
     return " | ".join(preview[:limit])
 
 
+def _extract_value_sequence(row: dict, columns: list[str]) -> str:
+    values = []
+    ordered_columns = columns or list(row.keys())
+    for column in ordered_columns:
+        if _clean_text(column).lower() == "metric":
+            continue
+        value = _clean_text(row.get(column, ""))
+        if value:
+            values.append(value)
+    return " | ".join(values)
+
+
+def _lookup_raw_row(table: dict, row_index: int, row: dict, columns: list[str]) -> str:
+    raw_lines = [line for line in _coerce_list(table.get("raw_lines")) if _clean_text(line)]
+    if raw_lines and row_index - 1 < len(raw_lines):
+        return _clean_text(raw_lines[row_index - 1])
+
+    raw_matrix = _coerce_list(table.get("raw_matrix"))
+    if raw_matrix and row_index < len(raw_matrix):
+        candidate = " ".join(_clean_text(cell) for cell in raw_matrix[row_index] if _clean_text(cell)).strip()
+        if candidate:
+            return candidate
+
+    row_text = _stringify_row(row, columns)
+    if row_text:
+        raw_fallback = re.sub(r"[A-Za-z0-9_ ]+:\s*", "", row_text)
+        raw_fallback = raw_fallback.replace("; ", " ").strip()
+        return raw_fallback or row_text
+    return ""
+
+
 def _base_evidence_doc(table: dict, evidence_type: str, row_id: str = "") -> dict:
     title = _get_table_title(table)
     table_id = _clean_text(table.get("table_id"))
@@ -73,7 +105,10 @@ def _base_evidence_doc(table: dict, evidence_type: str, row_id: str = "") -> dic
         "table_id": table_id,
         "row_id": row_id,
         "filename": _clean_text(table.get("filename")),
+        "file_type": _clean_text(table.get("file_type", "PDF")) or "PDF",
+        "file_path": _clean_text(table.get("file_path", "")),
         "page_number": int(table.get("page_number", 0) or 0),
+        "chunk_idx": 0,
         "table_title": title,
         "chunk_level": 3,
         "parent_chunk_id": "",
@@ -126,6 +161,8 @@ def _build_row_text(table: dict, row: dict, row_index: int, columns: list[str]) 
     table_id = _clean_text(table.get("table_id"))
     title = _get_table_title(table)
     row_values = _stringify_row(row, columns)
+    raw_row = _lookup_raw_row(table, row_index, row, columns)
+    values_sequence = _extract_value_sequence(row, columns)
     parts = [
         f"Document: {filename}",
         f"Page: {page_number}",
@@ -135,6 +172,10 @@ def _build_row_text(table: dict, row: dict, row_index: int, columns: list[str]) 
     ]
     if row_values:
         parts.append(f"Row Values: {row_values}")
+    if raw_row:
+        parts.append(f"Raw Row: {raw_row}")
+    if values_sequence:
+        parts.append(f"Values Sequence: {values_sequence}")
     if title:
         parts.append(f"Title: {title}")
     if columns:
