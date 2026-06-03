@@ -146,6 +146,13 @@ class MilvusManager:
                 schema.add_field("root_chunk_id", DataType.VARCHAR, max_length=512)
                 schema.add_field("chunk_level", DataType.INT64)
 
+                # 表格证据元数据字段。已有 collection 不会自动增补这些字段；
+                # 如开发环境需要启用，请手动重建 collection，代码不会自动删除用户数据。
+                schema.add_field("evidence_type", DataType.VARCHAR, max_length=50)
+                schema.add_field("table_id", DataType.VARCHAR, max_length=512)
+                schema.add_field("row_id", DataType.VARCHAR, max_length=512)
+                schema.add_field("table_title", DataType.VARCHAR, max_length=1024)
+
                 # 为两种向量分别创建索引
                 index_params = client.prepare_index_params()
                 
@@ -169,6 +176,12 @@ class MilvusManager:
                     collection_name=self.collection_name,
                     schema=schema,
                     index_params=index_params
+                )
+            else:
+                logger.info(
+                    "Milvus collection %s already exists; new table evidence fields are not auto-added. "
+                    "If you need evidence_type/table_id/row_id/table_title in development, rebuild the collection manually.",
+                    self.collection_name,
                 )
 
         self._run_with_reconnect(_init)
@@ -280,6 +293,10 @@ class MilvusManager:
             "filename",
             "file_type",
             "page_number",
+            "evidence_type",
+            "table_id",
+            "row_id",
+            "table_title",
             "chunk_id",
             "parent_chunk_id",
             "root_chunk_id",
@@ -339,6 +356,10 @@ class MilvusManager:
                     "filename": hit.get("filename", ""),
                     "file_type": hit.get("file_type", ""),
                     "page_number": hit.get("page_number", 0),
+                    "evidence_type": hit.get("evidence_type", "text_chunk") or "text_chunk",
+                    "table_id": hit.get("table_id", ""),
+                    "row_id": hit.get("row_id", ""),
+                    "table_title": hit.get("table_title", ""),
                     "chunk_id": hit.get("chunk_id", ""),
                     "parent_chunk_id": hit.get("parent_chunk_id", ""),
                     "root_chunk_id": hit.get("root_chunk_id", ""),
@@ -376,6 +397,10 @@ class MilvusManager:
                     "filename",
                     "file_type",
                     "page_number",
+                    "evidence_type",
+                    "table_id",
+                    "row_id",
+                    "table_title",
                     "chunk_id",
                     "parent_chunk_id",
                     "root_chunk_id",
@@ -395,6 +420,10 @@ class MilvusManager:
                     "filename": hit.get("entity", {}).get("filename", ""),
                     "file_type": hit.get("entity", {}).get("file_type", ""),
                     "page_number": hit.get("entity", {}).get("page_number", 0),
+                    "evidence_type": hit.get("entity", {}).get("evidence_type", "text_chunk") or "text_chunk",
+                    "table_id": hit.get("entity", {}).get("table_id", ""),
+                    "row_id": hit.get("entity", {}).get("row_id", ""),
+                    "table_title": hit.get("entity", {}).get("table_title", ""),
                     "chunk_id": hit.get("entity", {}).get("chunk_id", ""),
                     "parent_chunk_id": hit.get("entity", {}).get("parent_chunk_id", ""),
                     "root_chunk_id": hit.get("entity", {}).get("root_chunk_id", ""),
