@@ -98,7 +98,7 @@ def _parse_retrieval_mode(value: str | None) -> str:
 
 def _parse_table_aware_retrieval_mode(value: str | None) -> str:
     mode = (value or "off").strip().lower()
-    if mode not in {"off", "force"}:
+    if mode not in {"off", "force", "auto"}:
         return "off"
     return mode
 
@@ -142,6 +142,133 @@ def get_table_aware_retrieval_config() -> Dict[str, Any]:
         "max_rows": max(1, _parse_int(os.getenv("TABLE_AWARE_MAX_ROWS"), 8)),
         "max_context_chars": max(200, _parse_int(os.getenv("TABLE_AWARE_MAX_CONTEXT_CHARS"), 4000)),
     }
+
+
+_TABLE_QUERY_METRIC_HINTS = (
+    "net sales",
+    "revenue",
+    "ebit",
+    "ebitda",
+    "eps",
+    "cash flow",
+    "gross profit",
+    "operating income",
+    "cost of sales",
+    "assets",
+    "liabilities",
+    "debt",
+    "income",
+)
+
+_TABLE_QUERY_CONTACT_HINTS = (
+    "number",
+    "phone",
+    "toll-free",
+    "local number",
+    "conference id",
+    "contact",
+    "email",
+    "address",
+)
+
+_TABLE_QUERY_COMPARE_HINTS = (
+    "what was",
+    "how much",
+    "compare",
+    "growth",
+    "percentage",
+    "change",
+)
+
+_TABLE_QUERY_TABLE_HINTS = (
+    "table",
+    "row",
+    "column",
+    "data",
+    "表格",
+    "数据",
+)
+
+_TABLE_NUMERIC_PATTERN = re.compile(r"\(?-?\$?\d[\d,]*(?:\.\d+)?%?\)?")
+_TABLE_YEAR_PATTERN = re.compile(r"\b(?:19|20)\d{2}\b")
+_TABLE_VALUE_PATTERN = re.compile(r"\(?-?\d[\d,]*(?:\.\d+)?%?\)?|[—-]")
+
+
+def _query_triggers_table_aware_retrieval(query: str) -> tuple[bool, list[str]]:
+    text = (query or "").strip()
+    lowered = text.lower()
+    reasons: list[str] = []
+
+    if _TABLE_YEAR_PATTERN.search(text) or _TABLE_NUMERIC_PATTERN.search(text):
+        reasons.append("query_metric_or_number")
+    if any(token in lowered for token in ("$", "%", "million", "billion")):
+        reasons.append("query_metric_or_number")
+    if any(term in lowered for term in _TABLE_QUERY_TABLE_HINTS):
+        reasons.append("query_table_keyword")
+    if any(term in lowered for term in _TABLE_QUERY_METRIC_HINTS):
+        reasons.append("query_metric_or_number")
+    if any(term in lowered for term in _TABLE_QUERY_CONTACT_HINTS):
+        reasons.append("query_contact_or_number")
+    if any(term in lowered for term in _TABLE_QUERY_COMPARE_HINTS):
+        reasons.append("query_compare_or_number")
+
+    return bool(reasons), list(dict.fromkeys(reasons))
+
+
+def _count_numeric_values(text: str) -> int:
+    return len(_TABLE_VALUE_PATTERN.findall(text or ""))
+
+
+def _chunk_looks_table_like(text: str) -> bool:
+    normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not normalized.strip():
+        return False
+
+    lines = [line.strip() for line in normalized.split("\n") if line.strip()]
+    if not lines:
+        return False
+
+    numeric_rich_lines = [line for line in lines if _count_numeric_values(line) >= 3]
+    if len(numeric_rich_lines) >= 2:
+        return True
+
+    lowered = normalized.lower()
+    if any(metric in lowered for metric in _TABLE_QUERY_METRIC_HINTS) and any(
+        _count_numeric_values(line) >= 2 for line in lines
+    ):
+        return True
+
+    delimited_lines = [
+        line for line in lines if (line.count("|") >= 2 or line.count("  ") >= 3) and _count_numeric_values(line) >= 2
+    ]
+    if delimited_lines:
+        return True
+
+    return False
+
+
+def _retrieved_docs_trigger_table_aware_retrieval(docs: List[dict]) -> tuple[bool, list[str]]:
+    for doc in docs or []:
+        if _chunk_looks_table_like(doc.get("text", "") or ""):
+            return True, ["retrieved_table_like_chunk"]
+    return False, []
+
+
+def _should_enable_table_aware_retrieval(query: str, retrieved_docs: List[dict], mode: str) -> tuple[bool, bool, list[str]]:
+    if mode == "off":
+        return False, False, []
+    if mode == "force":
+        return True, True, ["force"]
+
+    query_triggered, query_reasons = _query_triggers_table_aware_retrieval(query)
+    if query_triggered:
+        return True, True, query_reasons
+
+    retrieved_triggered, retrieved_reasons = _retrieved_docs_trigger_table_aware_retrieval(retrieved_docs)
+    if retrieved_triggered:
+        return True, True, retrieved_reasons
+
+    return False, False, []
 
 
 def get_doc_name(filename: str) -> str:
@@ -1340,16 +1467,23 @@ def _merge_context_chunks(
     }
 
 
-def _build_table_context_doc(query: str) -> Tuple[dict | None, Dict[str, Any]]:
+def _build_table_context_doc(query: str, retrieved_docs: List[dict] | None = None) -> Tuple[dict | None, Dict[str, Any]]:
     config = get_table_aware_retrieval_config()
+    should_enable, auto_triggered, trigger_reasons = _should_enable_table_aware_retrieval(
+        query,
+        list(retrieved_docs or []),
+        config["mode"],
+    )
     base_meta = {
         "table_aware_retrieval_mode": config["mode"],
+        "table_aware_auto_triggered": auto_triggered,
+        "table_aware_trigger_reason": trigger_reasons,
         "table_evidence_hit_count": 0,
         "table_context_table_count": 0,
         "table_context_char_count": 0,
         "table_ids": [],
     }
-    if config["mode"] != "force":
+    if not should_enable:
         return None, base_meta
 
     try:
@@ -1619,7 +1753,10 @@ def retrieve_documents(
         enable_page_merge=apply_page_merge,
     )
     context_docs = list(finalized.get("context_docs", []) or [])
-    table_context_doc, table_context_meta = _build_table_context_doc(query)
+    table_context_doc, table_context_meta = _build_table_context_doc(
+        query,
+        finalized.get("final_retrieved_docs", []) or [],
+    )
     if table_context_doc:
         context_docs.append(table_context_doc)
     meta = {**candidates.get("meta", {}), **finalized.get("meta", {}), **table_context_meta}
@@ -1664,6 +1801,8 @@ def debug_retrieval_pipeline(question: str, top_k: int = 10) -> Dict[str, Any]:
         "rag_trace": {
             "retrieval_mode": meta.get("retrieval_mode", "baseline"),
             "table_aware_retrieval_mode": meta.get("table_aware_retrieval_mode", "off"),
+            "table_aware_auto_triggered": meta.get("table_aware_auto_triggered", False),
+            "table_aware_trigger_reason": meta.get("table_aware_trigger_reason", []) or [],
             "table_evidence_hit_count": meta.get("table_evidence_hit_count", 0),
             "table_context_table_count": meta.get("table_context_table_count", 0),
             "table_context_char_count": meta.get("table_context_char_count", 0),

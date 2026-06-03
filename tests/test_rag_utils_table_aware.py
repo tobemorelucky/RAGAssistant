@@ -84,6 +84,99 @@ def test_table_aware_retrieval_off_does_not_call_evidence_search(monkeypatch):
     assert meta["table_evidence_hit_count"] == 0
 
 
+def test_table_aware_retrieval_auto_query_metric_or_number_triggers(monkeypatch):
+    module = _install_rag_utils_stubs()
+
+    class _FakeMilvus:
+        def hybrid_retrieve(self, **kwargs):
+            return []
+
+    monkeypatch.setattr(module, "_milvus_manager", _FakeMilvus())
+    monkeypatch.setenv("TABLE_AWARE_RETRIEVAL", "auto")
+
+    doc, meta = module._build_table_context_doc("What was Amcor's net sales in fiscal year 2023?")
+
+    assert doc is None
+    assert meta["table_aware_retrieval_mode"] == "auto"
+    assert meta["table_aware_auto_triggered"] is True
+    assert "query_metric_or_number" in meta["table_aware_trigger_reason"]
+
+
+def test_table_aware_retrieval_auto_query_contact_or_number_triggers(monkeypatch):
+    module = _install_rag_utils_stubs()
+
+    class _FakeMilvus:
+        def hybrid_retrieve(self, **kwargs):
+            return []
+
+    monkeypatch.setattr(module, "_milvus_manager", _FakeMilvus())
+    monkeypatch.setenv("TABLE_AWARE_RETRIEVAL", "auto")
+
+    doc, meta = module._build_table_context_doc("What is the US and Canada conference call number?")
+
+    assert doc is None
+    assert meta["table_aware_auto_triggered"] is True
+    assert "query_contact_or_number" in meta["table_aware_trigger_reason"]
+
+
+def test_table_aware_retrieval_auto_summary_query_does_not_trigger(monkeypatch):
+    module = _install_rag_utils_stubs()
+
+    class _FailMilvus:
+        def hybrid_retrieve(self, **kwargs):
+            raise AssertionError("should not call table evidence retrieval when auto does not trigger")
+
+    monkeypatch.setattr(module, "_milvus_manager", _FailMilvus())
+    monkeypatch.setenv("TABLE_AWARE_RETRIEVAL", "auto")
+
+    doc, meta = module._build_table_context_doc("Summarize this document.")
+
+    assert doc is None
+    assert meta["table_aware_auto_triggered"] is False
+    assert meta["table_aware_trigger_reason"] == []
+
+
+def test_table_aware_retrieval_auto_business_query_does_not_trigger(monkeypatch):
+    module = _install_rag_utils_stubs()
+
+    class _FailMilvus:
+        def hybrid_retrieve(self, **kwargs):
+            raise AssertionError("should not call table evidence retrieval when auto does not trigger")
+
+    monkeypatch.setattr(module, "_milvus_manager", _FailMilvus())
+    monkeypatch.setenv("TABLE_AWARE_RETRIEVAL", "auto")
+
+    doc, meta = module._build_table_context_doc("Explain Amcor's business.")
+
+    assert doc is None
+    assert meta["table_aware_auto_triggered"] is False
+    assert meta["table_aware_trigger_reason"] == []
+
+
+def test_table_aware_retrieval_auto_retrieved_table_like_chunk_triggers(monkeypatch):
+    module = _install_rag_utils_stubs()
+
+    class _FakeMilvus:
+        def hybrid_retrieve(self, **kwargs):
+            return []
+
+    monkeypatch.setattr(module, "_milvus_manager", _FakeMilvus())
+    monkeypatch.setenv("TABLE_AWARE_RETRIEVAL", "auto")
+
+    doc, meta = module._build_table_context_doc(
+        "Explain this section.",
+        retrieved_docs=[
+            {
+                "text": "Net sales 3,909 3,673 14,544 14,694\nCost of sales (3,115) (2,951) (11,724) (11,969)"
+            }
+        ],
+    )
+
+    assert doc is None
+    assert meta["table_aware_auto_triggered"] is True
+    assert "retrieved_table_like_chunk" in meta["table_aware_trigger_reason"]
+
+
 def test_table_aware_retrieval_force_dedupes_ids_and_limits_tables(monkeypatch):
     module = _install_rag_utils_stubs()
 
@@ -186,6 +279,8 @@ def test_debug_retrieval_pipeline_exposes_table_aware_trace_fields(monkeypatch):
             "meta": {
                 "retrieval_mode": "baseline",
                 "table_aware_retrieval_mode": "force",
+                "table_aware_auto_triggered": True,
+                "table_aware_trigger_reason": ["force"],
                 "table_evidence_hit_count": 2,
                 "table_context_table_count": 1,
                 "table_context_char_count": 321,
@@ -199,6 +294,8 @@ def test_debug_retrieval_pipeline_exposes_table_aware_trace_fields(monkeypatch):
     trace = result["rag_trace"]
 
     assert trace["table_aware_retrieval_mode"] == "force"
+    assert trace["table_aware_auto_triggered"] is True
+    assert trace["table_aware_trigger_reason"] == ["force"]
     assert trace["table_evidence_hit_count"] == 2
     assert trace["table_context_table_count"] == 1
     assert trace["table_context_char_count"] == 321
