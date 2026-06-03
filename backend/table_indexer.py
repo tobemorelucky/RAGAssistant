@@ -59,10 +59,18 @@ def _preview_items(items: Iterable[str], limit: int) -> str:
 
 def _base_evidence_doc(table: dict, evidence_type: str, row_id: str = "") -> dict:
     title = _get_table_title(table)
+    table_id = _clean_text(table.get("table_id"))
+    if evidence_type == "table_summary":
+        chunk_id = f"{table_id}::summary"
+    elif evidence_type == "table_row":
+        chunk_id = f"{table_id}::row::{row_id}"
+    else:
+        chunk_id = f"{table_id}::raw::{row_id}"
     return {
         "text": "",
+        "chunk_id": chunk_id,
         "evidence_type": evidence_type,
-        "table_id": _clean_text(table.get("table_id")),
+        "table_id": table_id,
         "row_id": row_id,
         "filename": _clean_text(table.get("filename")),
         "page_number": int(table.get("page_number", 0) or 0),
@@ -125,12 +133,12 @@ def _build_row_text(table: dict, row: dict, row_index: int, columns: list[str]) 
         f"Row ID: row_{row_index}",
         "Evidence Type: table_row",
     ]
+    if row_values:
+        parts.append(f"Row Values: {row_values}")
     if title:
         parts.append(f"Title: {title}")
     if columns:
         parts.append(f"Columns: {' | '.join(columns)}")
-    if row_values:
-        parts.append(f"Row Values: {row_values}")
     return "\n".join(parts)
 
 

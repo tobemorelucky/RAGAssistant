@@ -3,9 +3,21 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
+
+
+def _configure_console_encoding() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+
+
+_configure_console_encoding()
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +40,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-pages", type=int, default=None, help="最多解析前多少页")
     parser.add_argument("--max-tables", type=int, default=20, help="最多展示多少张表，默认 20")
     parser.add_argument("--max-docs", type=int, default=30, help="最多展示多少条证据，默认 30")
+    parser.add_argument("--preview-chars", type=int, default=240, help="文本预览最大字符数，默认 240")
+    parser.add_argument("--output-json", default=None, help="将完整 evidence docs 写入 JSON 文件")
     return parser.parse_args(argv)
 
 
@@ -79,6 +93,7 @@ def build_report(
     *,
     max_tables: int,
     max_docs: int,
+    preview_chars: int,
     runtime_config: dict,
 ) -> str:
     lines = [
@@ -108,10 +123,11 @@ def build_report(
             [
                 f"evidence #{index}",
                 f"- evidence_type: {doc.get('evidence_type', '')}",
+                f"  chunk_id: {doc.get('chunk_id', '')}",
                 f"  table_id: {doc.get('table_id', '')}",
                 f"  row_id: {doc.get('row_id', '')}",
                 f"  page_number: {doc.get('page_number', '')}",
-                f"  text_preview: {_preview_text(doc.get('text', ''))}",
+                f"  text_preview: {_preview_text(doc.get('text', ''), preview_chars)}",
             ]
         )
     if len(evidence_docs) > max_docs:
@@ -125,6 +141,7 @@ def main(argv: list[str] | None = None) -> int:
     file_path = Path(args.pdf_path).expanduser().resolve()
     max_tables = _normalize_limit(args.max_tables, 20)
     max_docs = _normalize_limit(args.max_docs, 30)
+    preview_chars = _normalize_limit(args.preview_chars, 240)
 
     if not file_path.exists():
         print(f"文件不存在: {file_path}", file=sys.stderr)
@@ -153,6 +170,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"表格证据构造失败: {exc}", file=sys.stderr)
         return 1
 
+    if args.output_json:
+        output_path = Path(args.output_json).expanduser().resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(evidence_docs, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
     print(
         build_report(
             file_path,
@@ -160,6 +185,7 @@ def main(argv: list[str] | None = None) -> int:
             evidence_docs,
             max_tables=max_tables,
             max_docs=max_docs,
+            preview_chars=preview_chars,
             runtime_config=runtime_config,
         )
     )
