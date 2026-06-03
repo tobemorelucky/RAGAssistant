@@ -27,6 +27,12 @@ from finance_rag_features import (
 from query_parser import company_aliases_for, matches_company_text
 from milvus_client import MilvusManager
 from parent_chunk_store import ParentChunkStore
+from table_context_builder import (
+    dedupe_table_ids as _dedupe_table_ids_for_context,
+    build_table_context_preview as _build_table_context_preview,
+    truncate_table_context as _truncate_table_context,
+)
+from table_store import TableStore
 
 load_dotenv()
 
@@ -60,6 +66,7 @@ TRACE_OUTPUT_FIELDS = [
 _milvus_manager = MilvusManager()
 _parent_chunk_store = ParentChunkStore()
 _document_page_store = DocumentPageStore()
+_table_store = TableStore()
 
 _stepback_model = None
 
@@ -86,6 +93,13 @@ def _parse_retrieval_mode(value: str | None) -> str:
     mode = (value or "baseline").strip().lower()
     if mode not in {"baseline", "finance_experimental"}:
         return "baseline"
+    return mode
+
+
+def _parse_table_aware_retrieval_mode(value: str | None) -> str:
+    mode = (value or "off").strip().lower()
+    if mode not in {"off", "force"}:
+        return "off"
     return mode
 
 
@@ -117,6 +131,16 @@ def get_finance_rag_config() -> Dict[str, Any]:
         "w_year": float(os.getenv("FINANCE_RAG_W_YEAR", "0.10")),
         "w_doc_type": float(os.getenv("FINANCE_RAG_W_DOC_TYPE", "0.05")),
         "cover_toc_penalty": float(os.getenv("FINANCE_RAG_COVER_TOC_PENALTY", "0.40")),
+    }
+
+
+def get_table_aware_retrieval_config() -> Dict[str, Any]:
+    return {
+        "mode": _parse_table_aware_retrieval_mode(os.getenv("TABLE_AWARE_RETRIEVAL")),
+        "top_k": max(1, _parse_int(os.getenv("TABLE_AWARE_EVIDENCE_TOP_K"), 5)),
+        "max_tables": max(1, _parse_int(os.getenv("TABLE_AWARE_MAX_TABLES"), 3)),
+        "max_rows": max(1, _parse_int(os.getenv("TABLE_AWARE_MAX_ROWS"), 8)),
+        "max_context_chars": max(200, _parse_int(os.getenv("TABLE_AWARE_MAX_CONTEXT_CHARS"), 4000)),
     }
 
 
@@ -1316,6 +1340,70 @@ def _merge_context_chunks(
     }
 
 
+def _build_table_context_doc(query: str) -> Tuple[dict | None, Dict[str, Any]]:
+    config = get_table_aware_retrieval_config()
+    base_meta = {
+        "table_aware_retrieval_mode": config["mode"],
+        "table_evidence_hit_count": 0,
+        "table_context_table_count": 0,
+        "table_context_char_count": 0,
+        "table_ids": [],
+    }
+    if config["mode"] != "force":
+        return None, base_meta
+
+    try:
+        dense_embeddings, sparse_embeddings = _embedding_service.get_all_embeddings([query])
+        hits = _milvus_manager.hybrid_retrieve(
+            dense_embedding=dense_embeddings[0],
+            sparse_embedding=sparse_embeddings[0],
+            top_k=config["top_k"],
+            filter_expr='evidence_type != "text_chunk"',
+        )
+        table_ids = _dedupe_table_ids_for_context(hits)[: config["max_tables"]]
+        selected_hits = [hit for hit in hits if (hit.get("table_id") or "") in set(table_ids)]
+        tables = _table_store.get_tables_by_ids(table_ids) if table_ids else []
+        table_context = _build_table_context_preview(
+            selected_hits,
+            tables,
+            preview_rows=config["max_rows"],
+            preview_chars=config["max_context_chars"],
+        )
+        table_context = _truncate_table_context(table_context, config["max_context_chars"])
+        meta = {
+            **base_meta,
+            "table_evidence_hit_count": len(hits),
+            "table_context_table_count": len(tables),
+            "table_context_char_count": len(table_context),
+            "table_ids": table_ids,
+        }
+        if not table_context:
+            return None, meta
+        return (
+            {
+                "filename": "StructuredTableEvidence",
+                "doc_name": "StructuredTableEvidence",
+                "file_type": "TABLE_CONTEXT",
+                "page_number": "",
+                "chunk_id": "structured_table_context",
+                "parent_chunk_id": "",
+                "root_chunk_id": "",
+                "chunk_level": LEAF_RETRIEVE_LEVEL,
+                "chunk_idx": 0,
+                "type": "table_context",
+                "text": f"Additional structured table evidence:\n\n{table_context}",
+                "evidence_type": "table_context",
+                "table_id": "",
+                "row_id": "",
+                "table_title": "",
+            },
+            meta,
+        )
+    except Exception:
+        logger.exception("table-aware retrieval failed query=%s", query)
+        return None, base_meta
+
+
 def finalize_retrieved_documents(
     query: str,
     candidate_docs: List[dict],
@@ -1530,17 +1618,22 @@ def retrieve_documents(
         final_top_k=top_k,
         enable_page_merge=apply_page_merge,
     )
-    meta = {**candidates.get("meta", {}), **finalized.get("meta", {})}
+    context_docs = list(finalized.get("context_docs", []) or [])
+    table_context_doc, table_context_meta = _build_table_context_doc(query)
+    if table_context_doc:
+        context_docs.append(table_context_doc)
+    meta = {**candidates.get("meta", {}), **finalized.get("meta", {}), **table_context_meta}
     meta["latency_breakdown"] = {
         **(candidates.get("meta", {}).get("latency_breakdown", {}) or {}),
         **(finalized.get("meta", {}).get("latency_breakdown", {}) or {}),
+        "prompt_context_char_count_estimate": _estimate_prompt_chars(context_docs),
         "total_retrieval_ms": round((time.perf_counter() - started_at) * 1000, 2),
     }
     return {
-        "docs": finalized.get("context_docs", []),
+        "docs": context_docs,
         "candidate_docs": candidates.get("docs", []),
         "final_retrieved_docs": finalized.get("final_retrieved_docs", []),
-        "context_docs": finalized.get("context_docs", []),
+        "context_docs": context_docs,
         "meta": meta,
     }
 
@@ -1570,6 +1663,11 @@ def debug_retrieval_pipeline(question: str, top_k: int = 10) -> Dict[str, Any]:
         "query_parse": meta.get("query_parse", {}),
         "rag_trace": {
             "retrieval_mode": meta.get("retrieval_mode", "baseline"),
+            "table_aware_retrieval_mode": meta.get("table_aware_retrieval_mode", "off"),
+            "table_evidence_hit_count": meta.get("table_evidence_hit_count", 0),
+            "table_context_table_count": meta.get("table_context_table_count", 0),
+            "table_context_char_count": meta.get("table_context_char_count", 0),
+            "table_ids": meta.get("table_ids", []) or [],
             "two_stage_retrieval": meta.get("two_stage_retrieval", False),
             "selected_docs": meta.get("selected_docs", []) or meta.get("doc_stage_selected_docs", []) or [],
             "selected_pages": meta.get("selected_pages", []) or [],
