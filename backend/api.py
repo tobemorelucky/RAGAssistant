@@ -42,6 +42,8 @@ from schemas import (
     SessionListResponse,
     SessionMessagesResponse,
 )
+from table_config import get_table_aware_config
+from table_indexer import build_table_evidence_docs
 from table_store import TableStore
 from upload_jobs import DELETE_STEPS, delete_job_manager, upload_job_manager
 
@@ -58,6 +60,35 @@ milvus_writer = MilvusWriter(embedding_service=embedding_service, milvus_manager
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+def _prepare_table_evidence_docs(filename: str, tables: list[dict]) -> tuple[int, list[dict]]:
+    stored_table_count = 0
+    try:
+        stored_table_count = table_store.upsert_tables(tables)
+    except Exception:
+        logger.exception("table store upsert failed filename=%s", filename)
+
+    config = get_table_aware_config()
+    if not config.table_aware_ingestion or not tables:
+        return stored_table_count, []
+
+    try:
+        return stored_table_count, build_table_evidence_docs(tables)
+    except Exception:
+        logger.exception("table evidence build failed filename=%s", filename)
+        return stored_table_count, []
+
+
+def _write_table_evidence_docs_safe(filename: str, table_evidence_docs: list[dict]) -> int:
+    if not table_evidence_docs:
+        return 0
+    try:
+        milvus_writer.write_documents(table_evidence_docs)
+        return len(table_evidence_docs)
+    except Exception:
+        logger.exception("table evidence write failed filename=%s", filename)
+        return 0
 
 
 def _remove_bm25_stats_for_filename(filename: str) -> None:
@@ -287,16 +318,13 @@ def _process_upload_job(job_id: str, file_path: str, filename: str) -> None:
         upload_job_manager.update_step(job_id, "parent_store", 20, "running", "正在写入父级分块")
         parent_chunk_store.upsert_documents(parent_docs)
         document_page_store.upsert_pages(page_docs)
-        table_count = 0
-        try:
-            table_count = table_store.upsert_tables(tables)
-        except Exception:
-            logger.exception("table store upsert failed filename=%s", filename)
+        table_count, table_evidence_docs = _prepare_table_evidence_docs(filename, tables)
         logger.info(
-            "upload table extraction filename=%s parsed_tables=%s stored_tables=%s",
+            "upload table extraction filename=%s parsed_tables=%s stored_tables=%s prepared_table_evidence_docs=%s",
             filename,
             len(tables),
             table_count,
+            len(table_evidence_docs),
         )
         upload_job_manager.complete_step(job_id, "parent_store", f"父级分块已入库：{len(parent_docs)} 个")
 
@@ -325,13 +353,15 @@ def _process_upload_job(job_id: str, file_path: str, filename: str) -> None:
             )
 
         milvus_writer.write_documents(leaf_docs, progress_callback=_on_vector_progress)
+        written_table_evidence = _write_table_evidence_docs_safe(filename, table_evidence_docs)
         upload_job_manager.complete_step(job_id, "vector_store", f"向量化入库完成：{total_leaf} 个叶子分块")
         upload_job_manager.complete_job(job_id, f"成功上传并处理 {filename}")
         logger.info(
-            "upload finished filename=%s parent_chunks=%s leaf_chunks=%s",
+            "upload finished filename=%s parent_chunks=%s leaf_chunks=%s table_evidence_docs=%s",
             filename,
             len(parent_docs),
             total_leaf,
+            written_table_evidence,
         )
     except Exception as e:
         logger.exception("upload failed filename=%s step=%s", filename, failed_step)
@@ -592,15 +622,15 @@ async def upload_document(file: UploadFile = File(...), _: User = Depends(requir
 
         parent_chunk_store.upsert_documents(parent_docs)
         document_page_store.upsert_pages(page_docs)
-        try:
-            table_store.upsert_tables(tables)
-        except Exception:
-            logger.exception("table store upsert failed filename=%s", filename)
+        table_count, table_evidence_docs = _prepare_table_evidence_docs(filename, tables)
         milvus_writer.write_documents(leaf_docs)
+        written_table_evidence = _write_table_evidence_docs_safe(filename, table_evidence_docs)
         logger.info(
-            "upload table extraction filename=%s parsed_tables=%s",
+            "upload table extraction filename=%s parsed_tables=%s stored_tables=%s written_table_evidence_docs=%s",
             filename,
             len(tables),
+            table_count,
+            written_table_evidence,
         )
 
         return DocumentUploadResponse(

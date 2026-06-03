@@ -111,6 +111,8 @@ def test_normalize_financial_table_simple_two_year_table():
     assert normalized["normalized_columns"] == ["Metric", "2022", "2023"]
     assert normalized["normalized_rows"][0]["Metric"] == "Cash"
     assert normalized["normalized_rows"][1]["2023"] == "14,450"
+    assert normalized["normalized_rows"][0]["_raw_line"] == "Cash 848 1,021"
+    assert normalized["normalized_rows"][0]["_raw_row_index"] == 3
     assert normalized["columns"] == ["Metric", "2022", "2023"]
     assert normalized["rows"] == table["rows"]
 

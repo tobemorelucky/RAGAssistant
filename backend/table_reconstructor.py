@@ -538,7 +538,8 @@ def normalize_financial_table(table: dict) -> dict:
     title_rows = [item["cells"] for item in row_info if item["row_type"] == "title"]
     unit_rows = [item["cells"] for item in row_info if item["row_type"] == "unit"]
     header_rows = [item["cells"] for item in row_info if item["row_type"] in {"period_header", "year_header"}]
-    data_rows = [item["cells"] for item in row_info if item["row_type"] == "data"]
+    data_row_infos = [item for item in row_info if item["row_type"] == "data"]
+    data_rows = [item["cells"] for item in data_row_infos]
     footnote_rows = [item["line_text"] for item in row_info if item["row_type"] == "footnote"]
     section_rows = [item["line_text"] for item in row_info if item["row_type"] == "section"]
 
@@ -553,12 +554,15 @@ def normalize_financial_table(table: dict) -> dict:
 
     dominant_count = _dominant_numeric_tail_count(data_rows)
     parsed_rows = []
-    for row in data_rows:
+    for row_info_item in data_row_infos:
+        row = row_info_item["cells"]
         parsed = parse_numeric_tail_row(row)
         if parsed["numeric_tail_count"] < 2:
             continue
         if dominant_count and parsed["numeric_tail_count"] < dominant_count - 1:
             continue
+        parsed["_raw_line"] = row_info_item.get("line_text", "")
+        parsed["_raw_row_index"] = row_info_item.get("row_index")
         parsed_rows.append(parsed)
 
     column_schema = infer_column_schema(header_rows, data_rows, normalized_unit=normalized_unit)
@@ -575,6 +579,10 @@ def normalize_financial_table(table: dict) -> dict:
         row_payload = {"Metric": parsed["metric_label"]}
         for schema_item, value in zip(column_schema, padded_values[-numeric_count:]):
             row_payload[schema_item["label"]] = value
+        if parsed.get("_raw_line"):
+            row_payload["_raw_line"] = parsed.get("_raw_line", "")
+        if parsed.get("_raw_row_index") is not None:
+            row_payload["_raw_row_index"] = parsed.get("_raw_row_index")
         normalized_rows.append(row_payload)
 
     level = "raw_only"

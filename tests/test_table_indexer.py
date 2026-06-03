@@ -23,8 +23,8 @@ def test_normalized_table_generates_summary_and_table_rows():
             "normalized_title": "Condensed Consolidated Statements of Income",
             "normalized_columns": ["Metric", "2023", "2022"],
             "normalized_rows": [
-                {"Metric": "Revenue", "2023": "120", "2022": "100"},
-                {"Metric": "Operating margin", "2023": "20%", "2022": "18%"},
+                {"Metric": "Revenue", "2023": "120", "2022": "100", "_raw_line": "Revenue 120 100", "_raw_row_index": 1},
+                {"Metric": "Operating margin", "2023": "20%", "2022": "18%", "_raw_line": "Operating margin 20% 18%", "_raw_row_index": 2},
             ],
             "raw_matrix": [
                 ["Metric", "2023", "2022"],
@@ -166,6 +166,93 @@ def test_table_row_without_raw_matrix_or_raw_lines_does_not_fail():
     assert "Row Values:" in row_doc["text"]
     assert "Values Sequence: 3,909 | 3,673" in row_doc["text"]
     assert "Columns: Metric | Q1 | Q2" in row_doc["text"]
+
+
+def test_raw_row_does_not_pick_title_line_when_normalized_rows_have_internal_source():
+    docs = build_table_evidence_docs(
+        [
+            {
+                "accepted": True,
+                "table_id": "demo.pdf::table::p8::1",
+                "filename": "demo.pdf",
+                "page_number": 8,
+                "normalized_columns": ["Metric", "Q1", "Q2", "FY2022", "FY2023"],
+                "normalized_rows": [
+                    {
+                        "Metric": "Net sales",
+                        "Q1": "3,909",
+                        "Q2": "3,673",
+                        "FY2022": "14,544",
+                        "FY2023": "14,694",
+                        "_raw_line": "Net sales 3,909 3,673 14,544 14,694",
+                        "_raw_row_index": 4,
+                    }
+                ],
+                "raw_lines": [
+                    "Condensed Consolidated Statements of Income",
+                    "Three Months Ended June 30 Twelve Months Ended June 30",
+                    "Metric 2022 2023 2022 2023",
+                    "Net sales 3,909 3,673 14,544 14,694",
+                ],
+            }
+        ]
+    )
+
+    row_doc = docs[1]
+    assert "Raw Row: Net sales 3,909 3,673 14,544 14,694" in row_doc["text"]
+    assert "Raw Row: Condensed Consolidated Statements of Income" not in row_doc["text"]
+    assert "Values Sequence: 3,909 | 3,673 | 14,544 | 14,694" in row_doc["text"]
+
+
+def test_metric_matching_does_not_cross_match_to_different_row():
+    docs = build_table_evidence_docs(
+        [
+            {
+                "accepted": True,
+                "table_id": "demo.pdf::table::p9::1",
+                "filename": "demo.pdf",
+                "page_number": 9,
+                "normalized_columns": ["Metric", "2023", "2022"],
+                "normalized_rows": [
+                    {"Metric": "Selling, general, and administrative expenses", "2023": "(342)", "2022": "(329)"},
+                ],
+                "raw_lines": [
+                    "Net sales 3,909 3,673",
+                    "Selling, general, and administrative expenses (342) (329)",
+                ],
+            }
+        ]
+    )
+
+    row_doc = docs[1]
+    assert "Raw Row: Selling, general, and administrative expenses (342) (329)" in row_doc["text"]
+    assert "Raw Row: Net sales 3,909 3,673" not in row_doc["text"]
+
+
+def test_missing_reliable_raw_row_omits_raw_row():
+    docs = build_table_evidence_docs(
+        [
+            {
+                "accepted": True,
+                "table_id": "demo.pdf::table::p10::1",
+                "filename": "demo.pdf",
+                "page_number": 10,
+                "normalized_columns": ["Metric", "2023", "2022"],
+                "normalized_rows": [
+                    {"Metric": "Net sales", "2023": "3,909", "2022": "3,673"},
+                ],
+                "raw_lines": [
+                    "Condensed Consolidated Statements of Income",
+                    "Three Months Ended June 30 2023 2022",
+                ],
+            }
+        ]
+    )
+
+    row_doc = docs[1]
+    assert "Row Values:" in row_doc["text"]
+    assert "Values Sequence: 3,909 | 3,673" in row_doc["text"]
+    assert "Raw Row:" not in row_doc["text"]
 
 
 def test_debug_table_evidence_parse_args_support_preview_and_output_json():

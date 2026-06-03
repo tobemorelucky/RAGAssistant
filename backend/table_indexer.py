@@ -1,8 +1,6 @@
 """将已抽取的表格转换为仅用于调试预览的文本证据。"""
 
 from __future__ import annotations
-
-import re
 from typing import Iterable
 
 try:
@@ -40,11 +38,15 @@ def _stringify_row(row: dict, columns: list[str]) -> str:
     parts = []
     ordered_columns = columns or list(row.keys())
     for column in ordered_columns:
+        if _clean_text(column).startswith("_"):
+            continue
         value = _clean_text(row.get(column, ""))
         if value:
             parts.append(f"{column}: {value}")
     if not parts:
         for key, value in row.items():
+            if _clean_text(key).startswith("_"):
+                continue
             cleaned_value = _clean_text(value)
             if cleaned_value:
                 parts.append(f"{_clean_text(key)}: {cleaned_value}")
@@ -62,6 +64,8 @@ def _extract_value_sequence(row: dict, columns: list[str]) -> str:
     values = []
     ordered_columns = columns or list(row.keys())
     for column in ordered_columns:
+        if _clean_text(column).startswith("_"):
+            continue
         if _clean_text(column).lower() == "metric":
             continue
         value = _clean_text(row.get(column, ""))
@@ -70,22 +74,28 @@ def _extract_value_sequence(row: dict, columns: list[str]) -> str:
     return " | ".join(values)
 
 
-def _lookup_raw_row(table: dict, row_index: int, row: dict, columns: list[str]) -> str:
+def _match_raw_line_by_metric(table: dict, metric_label: str) -> str:
+    metric = _clean_text(metric_label).lower()
+    if not metric:
+        return ""
+    for line in _coerce_list(table.get("raw_lines")):
+        cleaned_line = _clean_text(line)
+        if cleaned_line and metric in cleaned_line.lower():
+            return cleaned_line
+    return ""
+
+
+def _lookup_raw_row(table: dict, row: dict, columns: list[str]) -> str:
+    row_raw_line = _clean_text(row.get("_raw_line", ""))
+    if row_raw_line:
+        return row_raw_line
+
+    metric_label = _clean_text(row.get("Metric", ""))
+    matched_line = _match_raw_line_by_metric(table, metric_label)
+    if matched_line:
+        return matched_line
+
     raw_lines = [line for line in _coerce_list(table.get("raw_lines")) if _clean_text(line)]
-    if raw_lines and row_index - 1 < len(raw_lines):
-        return _clean_text(raw_lines[row_index - 1])
-
-    raw_matrix = _coerce_list(table.get("raw_matrix"))
-    if raw_matrix and row_index < len(raw_matrix):
-        candidate = " ".join(_clean_text(cell) for cell in raw_matrix[row_index] if _clean_text(cell)).strip()
-        if candidate:
-            return candidate
-
-    row_text = _stringify_row(row, columns)
-    if row_text:
-        raw_fallback = re.sub(r"[A-Za-z0-9_ ]+:\s*", "", row_text)
-        raw_fallback = raw_fallback.replace("; ", " ").strip()
-        return raw_fallback or row_text
     return ""
 
 
@@ -161,7 +171,7 @@ def _build_row_text(table: dict, row: dict, row_index: int, columns: list[str]) 
     table_id = _clean_text(table.get("table_id"))
     title = _get_table_title(table)
     row_values = _stringify_row(row, columns)
-    raw_row = _lookup_raw_row(table, row_index, row, columns)
+    raw_row = _lookup_raw_row(table, row, columns)
     values_sequence = _extract_value_sequence(row, columns)
     parts = [
         f"Document: {filename}",

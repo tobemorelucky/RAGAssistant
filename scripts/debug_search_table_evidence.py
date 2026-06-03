@@ -32,6 +32,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("query", help="查询文本")
     parser.add_argument("--collection", default="table_evidence_test", help="Milvus collection 名称")
     parser.add_argument("--top-k", type=int, default=5, help="返回结果数，默认 5")
+    parser.add_argument("--preview-chars", type=int, default=240, help="文本预览最大字符数，默认 240")
+    parser.add_argument("--evidence-only", action="store_true", help="只检索表格证据，过滤 text_chunk")
     return parser.parse_args(argv)
 
 
@@ -49,7 +51,7 @@ def _preview_text(value: str, limit: int = 240) -> str:
     return text[: limit - 3] + "..."
 
 
-def build_report(query: str, collection_name: str, results: list[dict]) -> str:
+def build_report(query: str, collection_name: str, results: list[dict], *, preview_chars: int) -> str:
     lines = [
         f"query: {query}",
         f"collection name: {collection_name}",
@@ -65,7 +67,7 @@ def build_report(query: str, collection_name: str, results: list[dict]) -> str:
                 f"  row_id: {result.get('row_id', '')}",
                 f"  page_number: {result.get('page_number', '')}",
                 f"  table_title: {result.get('table_title', '')}",
-                f"  text_preview: {_preview_text(result.get('text', ''))}",
+                f"  text_preview: {_preview_text(result.get('text', ''), preview_chars)}",
             ]
         )
     return "\n".join(lines)
@@ -74,6 +76,7 @@ def build_report(query: str, collection_name: str, results: list[dict]) -> str:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     top_k = _normalize_limit(args.top_k, 5)
+    preview_chars = _normalize_limit(args.preview_chars, 240)
     collection_name = (args.collection or "table_evidence_test").strip()
     query = (args.query or "").strip()
 
@@ -86,16 +89,18 @@ def main(argv: list[str] | None = None) -> int:
     try:
         dense_embedding, sparse_embedding = embedding_service.get_all_embeddings([query])
         manager = MilvusManager()
+        filter_expr = 'evidence_type != "text_chunk"' if args.evidence_only else ""
         results = manager.hybrid_retrieve(
             dense_embedding=dense_embedding[0],
             sparse_embedding=sparse_embedding[0],
             top_k=top_k,
+            filter_expr=filter_expr,
         )
     except Exception as exc:
         print(f"搜索测试 collection 失败: {exc}", file=sys.stderr)
         return 1
 
-    print(build_report(query, collection_name, results))
+    print(build_report(query, collection_name, results, preview_chars=preview_chars))
     return 0
 
 
