@@ -84,6 +84,32 @@ def test_table_aware_retrieval_off_does_not_call_evidence_search(monkeypatch):
     assert meta["table_evidence_hit_count"] == 0
 
 
+def test_extract_query_anchors_keeps_entities_and_drops_generic_finance_words():
+    module = _install_rag_utils_stubs()
+
+    anchors = module.extract_query_anchors("What was Adobe operating margin in fiscal year 2022?")
+
+    assert "Adobe" in anchors
+    assert "margin" not in [anchor.lower() for anchor in anchors]
+    assert "fiscal" not in [anchor.lower() for anchor in anchors]
+
+
+def test_retrieve_candidate_documents_uses_text_chunk_filter(monkeypatch):
+    module = _install_rag_utils_stubs()
+
+    captured = {}
+
+    def _fake_retrieve_leaf_chunks(query, top_k, filter_expr, retrieval_scope):
+        captured["filter_expr"] = filter_expr
+        return {"docs": [], "meta": {"retrieval_mode": "global"}}
+
+    monkeypatch.setattr(module, "_retrieve_leaf_chunks", _fake_retrieve_leaf_chunks)
+
+    module.retrieve_candidate_documents("net sales", candidate_k=5)
+
+    assert captured["filter_expr"] == '(chunk_level == 3) and (evidence_type == "text_chunk" or evidence_type == "")'
+
+
 def test_table_aware_retrieval_auto_query_metric_or_number_triggers(monkeypatch):
     module = _install_rag_utils_stubs()
 
@@ -231,7 +257,7 @@ def test_table_aware_retrieval_force_dedupes_ids_and_limits_tables(monkeypatch):
 
     assert fake_table_store.called_with == ["t1"]
     assert meta["table_aware_retrieval_mode"] == "force"
-    assert meta["table_evidence_hit_count"] == 4
+    assert meta["table_evidence_hit_count"] == 2
     assert meta["table_context_table_count"] == 1
     assert meta["table_ids"] == ["t1"]
     assert meta["table_context_source"] == "global_fallback"
@@ -380,7 +406,7 @@ def test_table_aware_retrieval_uses_same_page_table_before_search(monkeypatch):
             {
                 "filename": "ADOBE_2022_10K.pdf",
                 "page_number": 88,
-                "text": "Operating margin 35% 34% 33%\nRevenue 100 90 80",
+                "text": "Adobe operating margin 35% 34% 33%\nRevenue 100 90 80",
             }
         ],
     )
@@ -555,6 +581,9 @@ def test_debug_retrieval_pipeline_exposes_table_aware_trace_fields(monkeypatch):
                 "table_aware_retrieval_mode": "force",
                 "table_aware_auto_triggered": True,
                 "table_aware_trigger_reason": ["force"],
+                "query_anchors": ["Adobe"],
+                "anchor_guard_applied": True,
+                "anchor_filtered_count": 2,
                 "table_context_source": "document_scoped_search",
                 "table_evidence_hit_count": 2,
                 "table_context_table_count": 1,
@@ -574,6 +603,9 @@ def test_debug_retrieval_pipeline_exposes_table_aware_trace_fields(monkeypatch):
     assert trace["table_aware_retrieval_mode"] == "force"
     assert trace["table_aware_auto_triggered"] is True
     assert trace["table_aware_trigger_reason"] == ["force"]
+    assert trace["query_anchors"] == ["Adobe"]
+    assert trace["anchor_guard_applied"] is True
+    assert trace["anchor_filtered_count"] == 2
     assert trace["table_context_source"] == "document_scoped_search"
     assert trace["table_evidence_hit_count"] == 2
     assert trace["table_context_table_count"] == 1
@@ -582,3 +614,100 @@ def test_debug_retrieval_pipeline_exposes_table_aware_trace_fields(monkeypatch):
     assert trace["table_candidate_pages"] == [{"filename": "demo.pdf", "page_number": 8}]
     assert trace["table_ids"] == ["t1"]
     assert trace["table_context_skipped_reasons"] == ["table_quality_rejected"]
+
+
+def test_table_aware_anchor_guard_filters_wrong_adobe_table(monkeypatch):
+    module = _install_rag_utils_stubs()
+
+    class _FakeMilvus:
+        def hybrid_retrieve(self, **kwargs):
+            assert kwargs["filter_expr"] == 'evidence_type != "text_chunk"'
+            return [
+                {
+                    "table_id": "aes::table::1",
+                    "filename": "1.pdf",
+                    "score": 0.9,
+                    "text": "Document: 1.pdf\nRow Values: Metric: Operating margin; 2022: 12%",
+                    "evidence_type": "table_row",
+                    "row_id": "row_1",
+                    "page_number": 8,
+                }
+            ]
+
+    class _FakeTableStore:
+        def get_tables_by_ids(self, table_ids):
+            return [
+                {
+                    "table_id": "aes::table::1",
+                    "filename": "1.pdf",
+                    "page_number": 8,
+                    "title": "Operating margin table",
+                    "columns": ["Metric", "2022"],
+                    "rows": [{"Metric": "Operating margin", "2022": "12%"}],
+                    "csv_text": "Operating margin,12%",
+                }
+            ]
+
+        def get_tables_by_filename(self, filename):
+            return []
+
+    monkeypatch.setattr(module, "_milvus_manager", _FakeMilvus())
+    monkeypatch.setattr(module, "_table_store", _FakeTableStore())
+    monkeypatch.setenv("TABLE_AWARE_RETRIEVAL", "force")
+
+    doc, meta = module._build_table_context_doc("What was Adobe operating margin in 2022?", retrieved_docs=[])
+
+    assert doc is None
+    assert meta["query_anchors"] == ["Adobe"]
+    assert meta["anchor_guard_applied"] is True
+    assert meta["anchor_filtered_count"] == 1
+    assert meta["table_context_source"] == "none"
+    assert "anchor_guard_filtered" in meta["table_context_skipped_reasons"]
+
+
+def test_table_aware_anchor_guard_filters_wrong_3m_table(monkeypatch):
+    module = _install_rag_utils_stubs()
+
+    class _FakeMilvus:
+        def hybrid_retrieve(self, **kwargs):
+            assert kwargs["filter_expr"] == 'evidence_type != "text_chunk"'
+            return [
+                {
+                    "table_id": "jnj::table::1",
+                    "filename": "2.pdf",
+                    "score": 0.9,
+                    "text": "Document: 2.pdf\nRow Values: Metric: Segment margin; 2022: 18%",
+                    "evidence_type": "table_row",
+                    "row_id": "row_1",
+                    "page_number": 12,
+                }
+            ]
+
+    class _FakeTableStore:
+        def get_tables_by_ids(self, table_ids):
+            return [
+                {
+                    "table_id": "jnj::table::1",
+                    "filename": "2.pdf",
+                    "page_number": 12,
+                    "title": "Segment margin table",
+                    "columns": ["Metric", "2022"],
+                    "rows": [{"Metric": "Segment margin", "2022": "18%"}],
+                    "csv_text": "Segment margin,18%",
+                }
+            ]
+
+        def get_tables_by_filename(self, filename):
+            return []
+
+    monkeypatch.setattr(module, "_milvus_manager", _FakeMilvus())
+    monkeypatch.setattr(module, "_table_store", _FakeTableStore())
+    monkeypatch.setenv("TABLE_AWARE_RETRIEVAL", "force")
+
+    doc, meta = module._build_table_context_doc("How did 3M segment margin change in 2022?", retrieved_docs=[])
+
+    assert doc is None
+    assert "3M" in meta["query_anchors"]
+    assert meta["anchor_guard_applied"] is True
+    assert meta["anchor_filtered_count"] == 1
+    assert "anchor_guard_filtered" in meta["table_context_skipped_reasons"]

@@ -195,9 +195,74 @@ _TABLE_QUERY_TABLE_HINTS = (
     "数据",
 )
 
+_QUERY_ANCHOR_STOPWORDS = {
+    "what",
+    "how",
+    "when",
+    "where",
+    "why",
+    "which",
+    "who",
+    "whom",
+    "whose",
+    "does",
+    "did",
+    "do",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "being",
+    "been",
+    "explain",
+    "summarize",
+    "describe",
+    "tell",
+    "show",
+    "sales",
+    "margin",
+    "ratio",
+    "growth",
+    "income",
+    "fiscal",
+    "year",
+    "company",
+    "segment",
+    "revenue",
+    "ebit",
+    "ebitda",
+    "eps",
+    "cash",
+    "flow",
+    "gross",
+    "profit",
+    "operating",
+    "cost",
+    "assets",
+    "liabilities",
+    "debt",
+    "tax",
+    "rate",
+    "quick",
+    "effective",
+    "stores",
+    "compare",
+    "change",
+    "increase",
+    "decrease",
+    "improving",
+    "document",
+    "table",
+    "row",
+    "column",
+    "data",
+}
+
 _TABLE_NUMERIC_PATTERN = re.compile(r"\(?-?\$?\d[\d,]*(?:\.\d+)?%?\)?")
 _TABLE_YEAR_PATTERN = re.compile(r"\b(?:19|20)\d{2}\b")
 _TABLE_VALUE_PATTERN = re.compile(r"\(?-?\d[\d,]*(?:\.\d+)?%?\)?|[—-]")
+_QUERY_ANCHOR_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9&'.-]*")
 
 
 def _query_triggers_table_aware_retrieval(query: str) -> tuple[bool, list[str]]:
@@ -224,8 +289,185 @@ def _query_triggers_table_aware_retrieval(query: str) -> tuple[bool, list[str]]:
     return bool(reasons), list(dict.fromkeys(reasons))
 
 
+def extract_query_anchors(query: str) -> list[str]:
+    text = (query or "").strip()
+    if not text:
+        return []
+
+    anchors: list[str] = []
+    seen = set()
+
+    def _add_anchor(value: str) -> None:
+        normalized = (value or "").strip()
+        normalized = re.sub(r"[’']s$", "", normalized, flags=re.IGNORECASE)
+        if not normalized:
+            return
+        lowered = normalized.lower()
+        if lowered in _QUERY_ANCHOR_STOPWORDS:
+            return
+        if normalized.isdigit():
+            return
+        if lowered in seen:
+            return
+        seen.add(lowered)
+        anchors.append(normalized)
+
+    tokens = _QUERY_ANCHOR_TOKEN_PATTERN.findall(text)
+    for token in tokens:
+        normalized_token = re.sub(r"[’']s$", "", token, flags=re.IGNORECASE)
+        lowered = normalized_token.lower()
+        if lowered in _QUERY_ANCHOR_STOPWORDS:
+            continue
+        if normalized_token.isupper() and any(ch.isalpha() for ch in normalized_token):
+            _add_anchor(normalized_token)
+            continue
+        if any(ch.isdigit() for ch in normalized_token) and any(ch.isalpha() for ch in normalized_token):
+            _add_anchor(normalized_token)
+            continue
+
+    title_matches = re.findall(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\b", text)
+    for match in title_matches:
+        parts = [part for part in match.split() if part]
+        if parts and all(part.lower() not in _QUERY_ANCHOR_STOPWORDS for part in parts):
+            _add_anchor(match)
+
+    for token in tokens:
+        normalized_token = re.sub(r"[’']s$", "", token, flags=re.IGNORECASE)
+        if normalized_token[:1].isupper() and normalized_token[1:].islower():
+            _add_anchor(normalized_token)
+
+    return anchors
+
+
 def _count_numeric_values(text: str) -> int:
     return len(_TABLE_VALUE_PATTERN.findall(text or ""))
+
+
+def _anchor_in_text(anchor: str, text: str) -> bool:
+    candidate = (text or "").strip()
+    if not anchor or not candidate:
+        return False
+    if anchor.isupper() or any(ch.isdigit() for ch in anchor):
+        return bool(re.search(rf"(?<![A-Za-z0-9]){re.escape(anchor)}(?![A-Za-z0-9])", candidate))
+    return anchor.lower() in candidate.lower()
+
+
+def _doc_matches_query_anchors(doc: dict, query_anchors: List[str]) -> bool:
+    if not query_anchors:
+        return True
+    haystack = "\n".join(
+        [
+            doc.get("text", "") or "",
+            doc.get("table_title", "") or "",
+        ]
+    )
+    return any(_anchor_in_text(anchor, haystack) for anchor in query_anchors)
+
+
+def _build_anchor_matched_filename_stats(docs: List[dict], query_anchors: List[str]) -> dict[str, int]:
+    stats: dict[str, int] = {}
+    if not query_anchors:
+        return stats
+    for doc in docs or []:
+        filename = (doc.get("filename") or "").strip()
+        if not filename:
+            continue
+        if _doc_matches_query_anchors(doc, query_anchors):
+            stats[filename] = stats.get(filename, 0) + 1
+    return stats
+
+
+def _apply_anchor_guard_to_docs(docs: List[dict], query_anchors: List[str]) -> tuple[List[dict], bool, int]:
+    if not query_anchors:
+        return list(docs or []), False, 0
+    anchor_filename_hits = _build_anchor_matched_filename_stats(docs or [], query_anchors)
+    filtered: list[dict] = []
+    filtered_count = 0
+    for doc in docs or []:
+        filename = (doc.get("filename") or "").strip()
+        direct_match = _doc_matches_query_anchors(doc, query_anchors)
+        filename_match = anchor_filename_hits.get(filename, 0) >= 2
+        if direct_match or filename_match:
+            filtered.append(doc)
+        else:
+            filtered_count += 1
+    if filtered:
+        return filtered, True, filtered_count
+    return list(docs or []), True, filtered_count
+
+
+def _table_matches_anchor_supporting_docs(table: dict, support_docs: List[dict], query_anchors: List[str]) -> bool:
+    if not query_anchors:
+        return True
+    filename = (table.get("filename") or "").strip()
+    table_page = table.get("page_number")
+    for doc in support_docs or []:
+        doc_filename = (doc.get("filename") or "").strip()
+        if filename and doc_filename and filename != doc_filename:
+            continue
+        doc_page = doc.get("page_number")
+        if table_page not in (None, "") and doc_page not in (None, "") and doc_page != table_page:
+            continue
+        if _doc_matches_query_anchors(doc, query_anchors):
+            return True
+    return False
+
+
+def _apply_anchor_guard_to_tables(
+    tables: List[dict],
+    hits: List[dict],
+    retrieved_docs: List[dict],
+    query_anchors: List[str],
+) -> tuple[List[dict], List[dict], bool, int]:
+    if not query_anchors:
+        return list(tables or []), list(hits or []), False, 0
+
+    anchor_filename_hits = _build_anchor_matched_filename_stats(retrieved_docs or [], query_anchors)
+    filtered_tables: list[dict] = []
+    allowed_table_ids: set[str] = set()
+    filtered_count = 0
+
+    for table in tables or []:
+        table_id = (table.get("table_id") or "").strip()
+        filename = (table.get("filename") or "").strip()
+        direct_match = _table_matches_query_anchors(table, query_anchors)
+        support_match = _table_matches_anchor_supporting_docs(table, hits or retrieved_docs or [], query_anchors)
+        filename_match = anchor_filename_hits.get(filename, 0) >= 2 if filename else False
+        if direct_match or support_match or filename_match:
+            filtered_tables.append(table)
+            if table_id:
+                allowed_table_ids.add(table_id)
+        else:
+            filtered_count += 1
+
+    if not filtered_tables:
+        return [], [], True, filtered_count
+
+    filtered_hits = [
+        hit
+        for hit in hits or []
+        if (hit.get("table_id") or "").strip() in allowed_table_ids
+        or _doc_matches_query_anchors(hit, query_anchors)
+    ]
+    return filtered_tables, filtered_hits, True, filtered_count
+
+
+def _table_matches_query_anchors(table: dict, query_anchors: List[str]) -> bool:
+    if not query_anchors:
+        return True
+    values = [
+        table.get("title", "") or "",
+        table.get("caption", "") or "",
+        table.get("csv_text", "") or "",
+    ]
+    rows = table.get("rows") or []
+    for row in rows[:8]:
+        if isinstance(row, dict):
+            values.extend(str(value) for value in row.values())
+        elif isinstance(row, list):
+            values.extend(str(value) for value in row)
+    haystack = "\n".join(values)
+    return any(_anchor_in_text(anchor, haystack) for anchor in query_anchors)
 
 
 def _chunk_looks_table_like(text: str) -> bool:
@@ -266,9 +508,11 @@ def _retrieved_docs_trigger_table_aware_retrieval(docs: List[dict]) -> tuple[boo
 def _extract_table_candidate_filenames(
     docs: List[dict],
     *,
+    query_anchors: List[str] | None = None,
     max_files: int = 3,
 ) -> list[str]:
     ranked: dict[str, dict[str, Any]] = {}
+    anchor_stats = _build_anchor_matched_filename_stats(docs, query_anchors or [])
     for rank, doc in enumerate(docs or [], 1):
         filename = (doc.get("filename") or "").strip()
         if not filename:
@@ -280,6 +524,7 @@ def _extract_table_candidate_filenames(
                 "count": 0,
                 "first_rank": rank,
                 "best_score": _combined_score(doc),
+                "anchor_hits": anchor_stats.get(filename, 0),
             },
         )
         item["count"] += 1
@@ -289,6 +534,7 @@ def _extract_table_candidate_filenames(
     ordered = sorted(
         ranked.values(),
         key=lambda item: (
+            -int(item["anchor_hits"]),
             -int(item["count"]),
             int(item["first_rank"]),
             -float(item["best_score"]),
@@ -304,6 +550,13 @@ def _build_table_evidence_filter_expr(candidate_filenames: List[str]) -> str:
         return base_expr
     quoted = ", ".join(f'"{_escape_milvus_string(name)}"' for name in filenames)
     return f"{base_expr} and filename in [{quoted}]"
+
+
+def _build_text_chunk_filter_expr(extra_expr: str = "") -> str:
+    text_expr = '(evidence_type == "text_chunk" or evidence_type == "")'
+    if not extra_expr:
+        return text_expr
+    return f"({extra_expr}) and {text_expr}"
 
 
 def _is_retrieved_table_evidence(doc: dict) -> bool:
@@ -1556,7 +1809,7 @@ def retrieve_candidate_documents(query: str, candidate_k: int | None = None) -> 
         config["final_top_k"],
         len(query or ""),
     )
-    filter_expr = f"chunk_level == {LEAF_RETRIEVE_LEVEL}"
+    filter_expr = _build_text_chunk_filter_expr(f"chunk_level == {LEAF_RETRIEVE_LEVEL}")
     base_meta: Dict[str, Any] = {
         "retrieval_mode": "failed",
         "candidate_k": candidate_k,
@@ -1601,6 +1854,7 @@ def _fetch_neighbor_page_docs(filename: str, page_number: int, page_window: int)
             f"page_number == {target_page} and "
             f"chunk_level == {LEAF_RETRIEVE_LEVEL}"
         )
+        filter_expr = _build_text_chunk_filter_expr(filter_expr)
         out.extend(_milvus_manager.query_all(filter_expr=filter_expr, output_fields=TRACE_OUTPUT_FIELDS))
     return out
 
@@ -1618,6 +1872,7 @@ def _fetch_neighbor_chunk_docs(filename: str, chunk_idx: int, chunk_window: int)
             f"chunk_idx == {target_idx} and "
             f"chunk_level == {LEAF_RETRIEVE_LEVEL}"
         )
+        filter_expr = _build_text_chunk_filter_expr(filter_expr)
         out.extend(_milvus_manager.query_all(filter_expr=filter_expr, output_fields=TRACE_OUTPUT_FIELDS))
     return out
 
@@ -1681,9 +1936,11 @@ def _merge_context_chunks(
 def _build_table_context_doc(query: str, retrieved_docs: List[dict] | None = None) -> Tuple[dict | None, Dict[str, Any]]:
     config = get_table_aware_retrieval_config()
     retrieved_docs = list(retrieved_docs or [])
+    query_anchors = extract_query_anchors(query)
     query_triggered, query_trigger_reasons = _query_triggers_table_aware_retrieval(query)
     candidate_filenames = _extract_table_candidate_filenames(
         retrieved_docs,
+        query_anchors=query_anchors,
         max_files=config["max_candidate_docs"],
     )
     candidate_pages = _extract_table_candidate_pages(retrieved_docs)
@@ -1697,6 +1954,9 @@ def _build_table_context_doc(query: str, retrieved_docs: List[dict] | None = Non
         "table_aware_retrieval_mode": config["mode"],
         "table_aware_auto_triggered": auto_triggered,
         "table_aware_trigger_reason": trigger_reasons,
+        "query_anchors": query_anchors,
+        "anchor_guard_applied": False,
+        "anchor_filtered_count": 0,
         "table_context_source": "none",
         "table_evidence_hit_count": 0,
         "table_context_table_count": 0,
@@ -1716,6 +1976,8 @@ def _build_table_context_doc(query: str, retrieved_docs: List[dict] | None = Non
         tables: list[dict] = []
         table_ids: list[str] = []
         table_evidence_hit_count = 0
+        anchor_guard_applied = False
+        anchor_filtered_count = 0
         full_table_ids: set[str] = set()
         skipped_table_reasons: dict[str, str] = {}
 
@@ -1771,6 +2033,27 @@ def _build_table_context_doc(query: str, retrieved_docs: List[dict] | None = Non
         elif not table_ids and not candidate_filenames:
             _append_skip_reason(skipped_reasons, "no_candidate_documents")
 
+        if tables:
+            tables, hits, anchor_guard_applied, anchor_filtered_count = _apply_anchor_guard_to_tables(
+                tables,
+                hits,
+                retrieved_docs,
+                query_anchors,
+            )
+            if not tables:
+                source = "none"
+                table_ids = []
+                table_evidence_hit_count = 0
+                full_table_ids.clear()
+                skipped_table_reasons.clear()
+                _append_skip_reason(skipped_reasons, "anchor_guard_filtered")
+                _append_skip_reason(skipped_reasons, "no_valid_table_candidates")
+            else:
+                selected_table_ids = {(table.get("table_id") or "").strip() for table in tables if table.get("table_id")}
+                table_ids = [table.get("table_id", "") for table in tables if table.get("table_id")]
+                hits = [hit for hit in hits if not selected_table_ids or (hit.get("table_id") or "").strip() in selected_table_ids]
+                table_evidence_hit_count = len(hits)
+
         for table in tables:
             table_id = (table.get("table_id") or "").strip()
             if not table_id:
@@ -1793,6 +2076,8 @@ def _build_table_context_doc(query: str, retrieved_docs: List[dict] | None = Non
         table_context = _truncate_table_context(table_context, config["max_context_chars"])
         meta = {
             **base_meta,
+            "anchor_guard_applied": anchor_guard_applied,
+            "anchor_filtered_count": anchor_filtered_count,
             "table_context_source": source,
             "table_evidence_hit_count": table_evidence_hit_count,
             "table_context_table_count": len(tables),
@@ -1863,6 +2148,9 @@ def finalize_retrieved_documents(
     stage_two_meta: Dict[str, Any] = {
         "retrieval_mode": retrieval_mode,
         "two_stage_retrieval": config["two_stage_retrieval"],
+        "query_anchors": extract_query_anchors(query),
+        "anchor_guard_applied": False,
+        "anchor_filtered_count": 0,
         "doc_stage_top_n": doc_stage_top_n,
         "page_stage_top_n": page_stage_top_n,
         "query_parse": {},
@@ -1925,6 +2213,18 @@ def finalize_retrieved_documents(
         combined_pack = _deduplicate_docs(
             evidence_pack_used + stage_two_candidates + fallback_candidates
         )
+        combined_pack, anchor_guard_applied, anchor_filtered_count = _apply_anchor_guard_to_docs(
+            combined_pack,
+            stage_two_meta.get("query_anchors", []) or [],
+        )
+        if evidence_pack_used:
+            filtered_used_pack, _, _ = _apply_anchor_guard_to_docs(
+                evidence_pack_used,
+                stage_two_meta.get("query_anchors", []) or [],
+            )
+            evidence_pack_used = filtered_used_pack
+        stage_two_meta["anchor_guard_applied"] = anchor_guard_applied
+        stage_two_meta["anchor_filtered_count"] = anchor_filtered_count
         if len(evidence_pack_used) < final_top_k:
             stage_two_meta["fallback_used"] = True
             stage_two_meta["fallback_reason"] = stage_two_meta.get("fallback_reason") or "insufficient_used_evidence"
@@ -1959,6 +2259,12 @@ def finalize_retrieved_documents(
             docs=rerank_input,
             top_k=max(final_top_k * 2, final_top_k),
         )
+        reranked_docs, anchor_guard_applied, anchor_filtered_count = _apply_anchor_guard_to_docs(
+            reranked_docs,
+            stage_two_meta.get("query_anchors", []) or [],
+        )
+        stage_two_meta["anchor_guard_applied"] = anchor_guard_applied
+        stage_two_meta["anchor_filtered_count"] = anchor_filtered_count
         final_docs, merge_meta = _auto_merge_documents(docs=reranked_docs, top_k=final_top_k)
         if len(final_docs) < final_top_k and len(reranked_docs) >= final_top_k:
             final_docs = reranked_docs[:final_top_k]
@@ -2091,6 +2397,9 @@ def debug_retrieval_pipeline(question: str, top_k: int = 10) -> Dict[str, Any]:
             "table_aware_retrieval_mode": meta.get("table_aware_retrieval_mode", "off"),
             "table_aware_auto_triggered": meta.get("table_aware_auto_triggered", False),
             "table_aware_trigger_reason": meta.get("table_aware_trigger_reason", []) or [],
+            "query_anchors": meta.get("query_anchors", []) or [],
+            "anchor_guard_applied": meta.get("anchor_guard_applied", False),
+            "anchor_filtered_count": meta.get("anchor_filtered_count", 0),
             "table_context_source": meta.get("table_context_source", "none"),
             "table_evidence_hit_count": meta.get("table_evidence_hit_count", 0),
             "table_context_table_count": meta.get("table_context_table_count", 0),
