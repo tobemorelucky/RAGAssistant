@@ -216,6 +216,7 @@ def test_table_aware_retrieval_force_dedupes_ids_and_limits_tables(monkeypatch):
     assert meta["table_evidence_hit_count"] == 4
     assert meta["table_context_table_count"] == 1
     assert meta["table_ids"] == ["t1"]
+    assert meta["table_context_source"] == "document_scoped_search"
     assert "Additional structured table evidence:" in doc["text"]
 
 
@@ -253,16 +254,16 @@ def test_table_aware_retrieval_candidate_filenames_are_ranked_deduped_and_limite
 
     filenames = module._extract_table_candidate_filenames(
         [
+            {"filename": "AES_2022_10K.pdf"},
             {"filename": "ADOBE_2022_10K.pdf"},
             {"filename": "ADOBE_2022_10K.pdf"},
             {"filename": "ADOBE_2021_10K.pdf"},
-            {"filename": "AES_2022_10K.pdf"},
             {"filename": "EXTRA.pdf"},
         ],
-        max_files=3,
+        max_files=2,
     )
 
-    assert filenames == ["ADOBE_2022_10K.pdf", "ADOBE_2021_10K.pdf", "AES_2022_10K.pdf"]
+    assert filenames == ["ADOBE_2022_10K.pdf", "AES_2022_10K.pdf"]
 
 
 def test_table_aware_retrieval_falls_back_to_global_when_no_candidate_filenames(monkeypatch):
@@ -281,6 +282,120 @@ def test_table_aware_retrieval_falls_back_to_global_when_no_candidate_filenames(
 
     assert doc is None
     assert meta["table_candidate_filenames"] == []
+
+
+def test_table_aware_retrieval_prefers_retrieved_table_chunks(monkeypatch):
+    module = _install_rag_utils_stubs()
+
+    class _FailMilvus:
+        def hybrid_retrieve(self, **kwargs):
+            raise AssertionError("should not search table evidence when retrieved table chunk already exists")
+
+    class _FakeTableStore:
+        def get_tables_by_ids(self, table_ids):
+            return [
+                {
+                    "table_id": "amd::table::1",
+                    "filename": "AMD_2022_10K.pdf",
+                    "page_number": 42,
+                    "columns": ["Metric", "2022"],
+                    "rows": [{"Metric": "Quick ratio", "2022": "1.84"}],
+                    "csv_text": "",
+                }
+            ]
+
+    monkeypatch.setattr(module, "_milvus_manager", _FailMilvus())
+    monkeypatch.setattr(module, "_table_store", _FakeTableStore())
+    monkeypatch.setenv("TABLE_AWARE_RETRIEVAL", "auto")
+
+    doc, meta = module._build_table_context_doc(
+        "What was AMD's quick ratio in 2022?",
+        retrieved_docs=[
+            {
+                "filename": "AMD_2022_10K.pdf",
+                "page_number": 42,
+                "table_id": "amd::table::1",
+                "evidence_type": "table_row",
+                "text": "Document: AMD_2022_10K.pdf\nRow Values: Metric: Quick ratio; 2022: 1.84",
+            }
+        ],
+    )
+
+    assert doc is not None
+    assert meta["table_context_source"] == "retrieved_table_chunk"
+    assert meta["table_ids"] == ["amd::table::1"]
+
+
+def test_table_aware_retrieval_uses_same_page_table_before_search(monkeypatch):
+    module = _install_rag_utils_stubs()
+
+    class _FailMilvus:
+        def hybrid_retrieve(self, **kwargs):
+            raise AssertionError("should not search table evidence when same-page table is available")
+
+    class _FakeTableStore:
+        def get_tables_by_ids(self, table_ids):
+            return []
+
+        def get_tables_by_filename(self, filename):
+            assert filename == "ADOBE_2022_10K.pdf"
+            return [
+                {
+                    "table_id": "adobe::table::1",
+                    "filename": "ADOBE_2022_10K.pdf",
+                    "page_number": 88,
+                    "columns": ["Metric", "2022"],
+                    "rows": [{"Metric": "Operating margin", "2022": "35%"}],
+                    "csv_text": "",
+                }
+            ]
+
+    monkeypatch.setattr(module, "_milvus_manager", _FailMilvus())
+    monkeypatch.setattr(module, "_table_store", _FakeTableStore())
+    monkeypatch.setenv("TABLE_AWARE_RETRIEVAL", "auto")
+
+    doc, meta = module._build_table_context_doc(
+        "What was Adobe operating margin in 2022?",
+        retrieved_docs=[
+            {
+                "filename": "ADOBE_2022_10K.pdf",
+                "page_number": 88,
+                "text": "Operating margin 35% 34% 33%\nRevenue 100 90 80",
+            }
+        ],
+    )
+
+    assert doc is not None
+    assert meta["table_context_source"] == "same_page_table"
+    assert meta["table_ids"] == ["adobe::table::1"]
+    assert meta["table_candidate_pages"] == [{"filename": "ADOBE_2022_10K.pdf", "page_number": 88}]
+
+
+def test_table_aware_retrieval_auto_document_scoped_fallback_requires_query_trigger(monkeypatch):
+    module = _install_rag_utils_stubs()
+
+    class _FailMilvus:
+        def hybrid_retrieve(self, **kwargs):
+            raise AssertionError("should not fall back to document-scoped table search for non-data query")
+
+    class _FakeTableStore:
+        def get_tables_by_ids(self, table_ids):
+            return []
+
+        def get_tables_by_filename(self, filename):
+            return []
+
+    monkeypatch.setattr(module, "_milvus_manager", _FailMilvus())
+    monkeypatch.setattr(module, "_table_store", _FakeTableStore())
+    monkeypatch.setenv("TABLE_AWARE_RETRIEVAL", "auto")
+
+    doc, meta = module._build_table_context_doc(
+        "Explain Amcor's business.",
+        retrieved_docs=[{"filename": "AMCOR_2023_10K.pdf", "page_number": 12, "text": "Business overview and strategy."}],
+    )
+
+    assert doc is None
+    assert meta["table_context_source"] == "none"
 
 
 def test_table_context_respects_max_context_chars(monkeypatch):
@@ -345,10 +460,12 @@ def test_debug_retrieval_pipeline_exposes_table_aware_trace_fields(monkeypatch):
                 "table_aware_retrieval_mode": "force",
                 "table_aware_auto_triggered": True,
                 "table_aware_trigger_reason": ["force"],
+                "table_context_source": "document_scoped_search",
                 "table_evidence_hit_count": 2,
                 "table_context_table_count": 1,
                 "table_context_char_count": 321,
                 "table_candidate_filenames": ["demo.pdf"],
+                "table_candidate_pages": [{"filename": "demo.pdf", "page_number": 8}],
                 "table_ids": ["t1"],
                 "latency_breakdown": {"total_retrieval_ms": 12.3},
             },
@@ -361,8 +478,10 @@ def test_debug_retrieval_pipeline_exposes_table_aware_trace_fields(monkeypatch):
     assert trace["table_aware_retrieval_mode"] == "force"
     assert trace["table_aware_auto_triggered"] is True
     assert trace["table_aware_trigger_reason"] == ["force"]
+    assert trace["table_context_source"] == "document_scoped_search"
     assert trace["table_evidence_hit_count"] == 2
     assert trace["table_context_table_count"] == 1
     assert trace["table_context_char_count"] == 321
     assert trace["table_candidate_filenames"] == ["demo.pdf"]
+    assert trace["table_candidate_pages"] == [{"filename": "demo.pdf", "page_number": 8}]
     assert trace["table_ids"] == ["t1"]

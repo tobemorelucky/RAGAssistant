@@ -150,6 +150,11 @@ _TABLE_QUERY_METRIC_HINTS = (
     "ebit",
     "ebitda",
     "eps",
+    "ratio",
+    "margin",
+    "growth",
+    "stores",
+    "tax rate",
     "cash flow",
     "gross profit",
     "operating income",
@@ -199,18 +204,21 @@ def _query_triggers_table_aware_retrieval(query: str) -> tuple[bool, list[str]]:
     lowered = text.lower()
     reasons: list[str] = []
 
-    if _TABLE_YEAR_PATTERN.search(text) or _TABLE_NUMERIC_PATTERN.search(text):
-        reasons.append("query_metric_or_number")
-    if any(token in lowered for token in ("$", "%", "million", "billion")):
-        reasons.append("query_metric_or_number")
-    if any(term in lowered for term in _TABLE_QUERY_TABLE_HINTS):
-        reasons.append("query_table_keyword")
-    if any(term in lowered for term in _TABLE_QUERY_METRIC_HINTS):
-        reasons.append("query_metric_or_number")
-    if any(term in lowered for term in _TABLE_QUERY_CONTACT_HINTS):
+    has_numeric = bool(_TABLE_NUMERIC_PATTERN.search(text) or _TABLE_YEAR_PATTERN.search(text))
+    has_money_or_percent = any(token in lowered for token in ("$", "%", "million", "billion"))
+    has_table_keyword = any(term in lowered for term in _TABLE_QUERY_TABLE_HINTS)
+    has_metric_keyword = any(term in lowered for term in _TABLE_QUERY_METRIC_HINTS)
+    has_contact_keyword = any(term in lowered for term in _TABLE_QUERY_CONTACT_HINTS)
+    has_compare_keyword = any(term in lowered for term in _TABLE_QUERY_COMPARE_HINTS)
+
+    if has_contact_keyword:
         reasons.append("query_contact_or_number")
-    if any(term in lowered for term in _TABLE_QUERY_COMPARE_HINTS):
+    if has_metric_keyword and (has_numeric or has_money_or_percent or has_compare_keyword):
+        reasons.append("query_metric_or_number")
+    if has_compare_keyword and (has_metric_keyword or has_money_or_percent):
         reasons.append("query_compare_or_number")
+    if has_table_keyword and (has_metric_keyword or has_numeric or has_money_or_percent):
+        reasons.append("query_table_keyword")
 
     return bool(reasons), list(dict.fromkeys(reasons))
 
@@ -254,18 +262,47 @@ def _retrieved_docs_trigger_table_aware_retrieval(docs: List[dict]) -> tuple[boo
     return False, []
 
 
-def _extract_table_candidate_filenames(docs: List[dict], max_files: int = 3) -> list[str]:
-    out: list[str] = []
-    seen = set()
-    for doc in docs or []:
+def _matches_query_company_filename(filename: str, query_parse: dict | None) -> bool:
+    company = ((query_parse or {}).get("company") or "").strip()
+    if not company or not filename:
+        return False
+    filename_text = filename.replace("_", " ").replace("-", " ").lower()
+    aliases = [company.lower(), *[alias.lower() for alias in company_aliases_for(company)]]
+    return any(alias and alias in filename_text for alias in aliases)
+
+
+def _extract_table_candidate_filenames(
+    docs: List[dict],
+    *,
+    query_parse: dict | None = None,
+    max_files: int = 2,
+) -> list[str]:
+    ranked: dict[str, dict[str, Any]] = {}
+    for rank, doc in enumerate(docs or [], 1):
         filename = (doc.get("filename") or "").strip()
-        if not filename or filename in seen:
+        if not filename:
             continue
-        seen.add(filename)
-        out.append(filename)
-        if len(out) >= max(1, max_files):
-            break
-    return out
+        item = ranked.setdefault(
+            filename,
+            {
+                "filename": filename,
+                "count": 0,
+                "first_rank": rank,
+                "company_match": _matches_query_company_filename(filename, query_parse),
+            },
+        )
+        item["count"] += 1
+        item["first_rank"] = min(item["first_rank"], rank)
+
+    ordered = sorted(
+        ranked.values(),
+        key=lambda item: (
+            -int(bool(item["company_match"])),
+            -int(item["count"]),
+            int(item["first_rank"]),
+        ),
+    )
+    return [item["filename"] for item in ordered[: max(1, max_files)]]
 
 
 def _build_table_evidence_filter_expr(candidate_filenames: List[str]) -> str:
@@ -275,6 +312,116 @@ def _build_table_evidence_filter_expr(candidate_filenames: List[str]) -> str:
         return base_expr
     quoted = ", ".join(f'"{_escape_milvus_string(name)}"' for name in filenames)
     return f"{base_expr} and filename in [{quoted}]"
+
+
+def _is_retrieved_table_evidence(doc: dict) -> bool:
+    evidence_type = (doc.get("evidence_type") or "").strip()
+    chunk_id = (doc.get("chunk_id") or "").strip()
+    table_id = (doc.get("table_id") or "").strip()
+    return (
+        evidence_type in {"table_summary", "table_row", "table_raw"}
+        or bool(table_id)
+        or "::table::" in chunk_id
+    )
+
+
+def _extract_retrieved_table_ids(docs: List[dict], max_tables: int) -> list[str]:
+    out: list[str] = []
+    seen = set()
+    for doc in docs or []:
+        if not _is_retrieved_table_evidence(doc):
+            continue
+        table_id = (doc.get("table_id") or "").strip()
+        if not table_id or table_id in seen:
+            continue
+        seen.add(table_id)
+        out.append(table_id)
+        if len(out) >= max(1, max_tables):
+            break
+    return out
+
+
+def _extract_table_candidate_pages(docs: List[dict], max_pages: int = 6) -> list[dict]:
+    out: list[dict] = []
+    seen = set()
+    for doc in docs or []:
+        if _is_retrieved_table_evidence(doc):
+            continue
+        filename = (doc.get("filename") or "").strip()
+        page_number = _coerce_int(doc.get("page_number"))
+        if not filename or page_number is None:
+            continue
+        if not _chunk_looks_table_like(doc.get("text", "") or ""):
+            continue
+        key = (filename, page_number)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"filename": filename, "page_number": page_number})
+        if len(out) >= max(1, max_pages):
+            break
+    return out
+
+
+def _fetch_tables_for_candidate_pages(candidate_pages: List[dict], max_tables: int) -> list[dict]:
+    if not candidate_pages:
+        return []
+    page_map: dict[str, set[int]] = {}
+    ordered_filenames: list[str] = []
+    for item in candidate_pages:
+        filename = (item.get("filename") or "").strip()
+        page_number = _coerce_int(item.get("page_number"))
+        if not filename or page_number is None:
+            continue
+        if filename not in page_map:
+            page_map[filename] = set()
+            ordered_filenames.append(filename)
+        page_map[filename].add(page_number)
+
+    out: list[dict] = []
+    seen = set()
+    for filename in ordered_filenames:
+        tables = _table_store.get_tables_by_filename(filename)
+        for table in tables:
+            table_id = (table.get("table_id") or "").strip()
+            page_number = _coerce_int(table.get("page_number"))
+            if not table_id or table_id in seen or page_number not in page_map.get(filename, set()):
+                continue
+            seen.add(table_id)
+            out.append(table)
+            if len(out) >= max(1, max_tables):
+                return out
+    return out
+
+
+def _build_same_page_table_hits(tables: List[dict], docs: List[dict]) -> list[dict]:
+    hits: list[dict] = []
+    table_by_page: dict[tuple[str, int], list[dict]] = {}
+    for table in tables or []:
+        filename = (table.get("filename") or "").strip()
+        page_number = _coerce_int(table.get("page_number"))
+        if not filename or page_number is None:
+            continue
+        table_by_page.setdefault((filename, page_number), []).append(table)
+
+    for doc in docs or []:
+        filename = (doc.get("filename") or "").strip()
+        page_number = _coerce_int(doc.get("page_number"))
+        if not filename or page_number is None:
+            continue
+        matched_tables = table_by_page.get((filename, page_number), [])
+        for table in matched_tables:
+            hits.append(
+                {
+                    "table_id": table.get("table_id", ""),
+                    "score": _combined_score(doc),
+                    "text": doc.get("text", "") or "",
+                    "evidence_type": "same_page_table",
+                    "row_id": "",
+                    "page_number": page_number,
+                }
+            )
+    return hits
 
 
 def _should_enable_table_aware_retrieval(query: str, retrieved_docs: List[dict], mode: str) -> tuple[bool, bool, list[str]]:
@@ -1492,39 +1639,87 @@ def _merge_context_chunks(
 
 def _build_table_context_doc(query: str, retrieved_docs: List[dict] | None = None) -> Tuple[dict | None, Dict[str, Any]]:
     config = get_table_aware_retrieval_config()
-    candidate_filenames = _extract_table_candidate_filenames(list(retrieved_docs or []), max_files=3)
+    retrieved_docs = list(retrieved_docs or [])
+    query_triggered, query_trigger_reasons = _query_triggers_table_aware_retrieval(query)
+    query_parse = parse_finance_query(query)
+    candidate_filenames = _extract_table_candidate_filenames(
+        retrieved_docs,
+        query_parse=query_parse,
+        max_files=2,
+    )
+    candidate_pages = _extract_table_candidate_pages(retrieved_docs)
     should_enable, auto_triggered, trigger_reasons = _should_enable_table_aware_retrieval(
         query,
-        list(retrieved_docs or []),
+        retrieved_docs,
         config["mode"],
     )
     base_meta = {
         "table_aware_retrieval_mode": config["mode"],
         "table_aware_auto_triggered": auto_triggered,
         "table_aware_trigger_reason": trigger_reasons,
+        "table_context_source": "none",
         "table_evidence_hit_count": 0,
         "table_context_table_count": 0,
         "table_context_char_count": 0,
         "table_candidate_filenames": candidate_filenames,
+        "table_candidate_pages": candidate_pages,
         "table_ids": [],
     }
     if not should_enable:
         return None, base_meta
 
     try:
-        filter_expr = _build_table_evidence_filter_expr(candidate_filenames)
-        dense_embeddings, sparse_embeddings = _embedding_service.get_all_embeddings([query])
-        hits = _milvus_manager.hybrid_retrieve(
-            dense_embedding=dense_embeddings[0],
-            sparse_embedding=sparse_embeddings[0],
-            top_k=config["top_k"],
-            filter_expr=filter_expr,
-        )
-        table_ids = _dedupe_table_ids_for_context(hits)[: config["max_tables"]]
-        selected_hits = [hit for hit in hits if (hit.get("table_id") or "") in set(table_ids)]
-        tables = _table_store.get_tables_by_ids(table_ids) if table_ids else []
+        source = "none"
+        hits: list[dict] = []
+        tables: list[dict] = []
+        table_ids: list[str] = []
+        table_evidence_hit_count = 0
+
+        retrieved_table_ids = _extract_retrieved_table_ids(retrieved_docs, config["max_tables"])
+        if retrieved_table_ids:
+            candidate_tables = _table_store.get_tables_by_ids(retrieved_table_ids)
+            tables = candidate_tables[: config["max_tables"]]
+            table_ids = [table.get("table_id", "") for table in tables if table.get("table_id")]
+            if table_ids:
+                selected_table_ids = set(table_ids)
+                hits = [doc for doc in retrieved_docs if (doc.get("table_id") or "") in selected_table_ids]
+                table_evidence_hit_count = len(hits)
+                source = "retrieved_table_chunk"
+
+        if not table_ids and candidate_pages:
+            candidate_tables = _fetch_tables_for_candidate_pages(candidate_pages, config["max_tables"])
+            if candidate_tables:
+                tables = candidate_tables[: config["max_tables"]]
+                table_ids = [table.get("table_id", "") for table in tables if table.get("table_id")]
+                hits = _build_same_page_table_hits(tables, retrieved_docs)
+                table_evidence_hit_count = len(hits)
+                source = "same_page_table"
+
+        if not table_ids and (config["mode"] == "force" or (config["mode"] == "auto" and query_triggered)):
+            filter_expr = _build_table_evidence_filter_expr(candidate_filenames)
+            dense_embeddings, sparse_embeddings = _embedding_service.get_all_embeddings([query])
+            search_hits = _milvus_manager.hybrid_retrieve(
+                dense_embedding=dense_embeddings[0],
+                sparse_embedding=sparse_embeddings[0],
+                top_k=config["top_k"],
+                filter_expr=filter_expr,
+            )
+            search_table_ids = _dedupe_table_ids_for_context(search_hits)[: config["max_tables"]]
+            selected_hits = [hit for hit in search_hits if (hit.get("table_id") or "") in set(search_table_ids)]
+            candidate_tables = _table_store.get_tables_by_ids(search_table_ids) if search_table_ids else []
+            if candidate_filenames:
+                candidate_tables = [
+                    table for table in candidate_tables if (table.get("filename") or "") in set(candidate_filenames)
+                ]
+            if candidate_tables:
+                tables = candidate_tables[: config["max_tables"]]
+                table_ids = [table.get("table_id", "") for table in tables if table.get("table_id")]
+                hits = [hit for hit in selected_hits if (hit.get("table_id") or "") in set(table_ids)]
+                table_evidence_hit_count = len(search_hits)
+                source = "document_scoped_search"
+
         table_context = _build_table_context_preview(
-            selected_hits,
+            hits,
             tables,
             preview_rows=config["max_rows"],
             preview_chars=config["max_context_chars"],
@@ -1532,7 +1727,8 @@ def _build_table_context_doc(query: str, retrieved_docs: List[dict] | None = Non
         table_context = _truncate_table_context(table_context, config["max_context_chars"])
         meta = {
             **base_meta,
-            "table_evidence_hit_count": len(hits),
+            "table_context_source": source,
+            "table_evidence_hit_count": table_evidence_hit_count,
             "table_context_table_count": len(tables),
             "table_context_char_count": len(table_context),
             "table_ids": table_ids,
@@ -1829,10 +2025,12 @@ def debug_retrieval_pipeline(question: str, top_k: int = 10) -> Dict[str, Any]:
             "table_aware_retrieval_mode": meta.get("table_aware_retrieval_mode", "off"),
             "table_aware_auto_triggered": meta.get("table_aware_auto_triggered", False),
             "table_aware_trigger_reason": meta.get("table_aware_trigger_reason", []) or [],
+            "table_context_source": meta.get("table_context_source", "none"),
             "table_evidence_hit_count": meta.get("table_evidence_hit_count", 0),
             "table_context_table_count": meta.get("table_context_table_count", 0),
             "table_context_char_count": meta.get("table_context_char_count", 0),
             "table_candidate_filenames": meta.get("table_candidate_filenames", []) or [],
+            "table_candidate_pages": meta.get("table_candidate_pages", []) or [],
             "table_ids": meta.get("table_ids", []) or [],
             "two_stage_retrieval": meta.get("two_stage_retrieval", False),
             "selected_docs": meta.get("selected_docs", []) or meta.get("doc_stage_selected_docs", []) or [],
