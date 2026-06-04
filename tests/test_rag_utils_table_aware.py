@@ -711,3 +711,138 @@ def test_table_aware_anchor_guard_filters_wrong_3m_table(monkeypatch):
     assert meta["anchor_guard_applied"] is True
     assert meta["anchor_filtered_count"] == 1
     assert "anchor_guard_filtered" in meta["table_context_skipped_reasons"]
+
+
+def test_retrieve_documents_off_keeps_plain_text_context(monkeypatch):
+    module = _install_rag_utils_stubs()
+
+    plain_doc = {
+        "filename": "1.pdf",
+        "doc_name": "1",
+        "page_number": 8,
+        "chunk_id": "c1",
+        "text": "Plain paragraph context.",
+        "type": "chunk",
+        "evidence_type": "text_chunk",
+    }
+
+    monkeypatch.setenv("TABLE_AWARE_RETRIEVAL", "off")
+    monkeypatch.setattr(module, "retrieve_candidate_documents", lambda query, candidate_k=None: {"docs": [plain_doc], "meta": {}})
+    monkeypatch.setattr(
+        module,
+        "finalize_retrieved_documents",
+        lambda query, candidate_docs, final_top_k=None, enable_page_merge=None, adjacent_page_window=None, adjacent_chunk_window=None: {
+            "final_retrieved_docs": [plain_doc],
+            "context_docs": [plain_doc],
+            "meta": {},
+        },
+    )
+
+    result = module.retrieve_documents("Explain this document.", top_k=5)
+
+    assert result["context_docs"] == [plain_doc]
+    assert result["meta"]["table_aware_retrieval_mode"] == "off"
+    assert result["meta"]["evidence_unit_count"] == 0
+
+
+def test_retrieve_documents_auto_attaches_same_page_table_from_context_doc(monkeypatch):
+    module = _install_rag_utils_stubs()
+
+    doc = {
+        "filename": "1.pdf",
+        "doc_name": "1",
+        "page_number": 8,
+        "chunk_id": "c1",
+        "text": "Net sales 3,909 3,673 14,544 14,694\nCost of sales (3,115) (2,951) (11,724) (11,969)",
+        "type": "chunk",
+        "evidence_type": "text_chunk",
+    }
+
+    class _FakeTableStore:
+        def get_tables_by_filename(self, filename):
+            return [
+                {
+                    "table_id": "t1",
+                    "filename": "1.pdf",
+                    "page_number": 8,
+                    "columns": ["Metric", "2023", "2022"],
+                    "rows": [{"Metric": "Net sales", "2023": "3,909", "2022": "3,673"}],
+                    "csv_text": "Metric,2023,2022\nNet sales,3,909,3,673",
+                    "title": "Statements of Income",
+                }
+            ]
+
+        def get_tables_by_ids(self, table_ids):
+            return []
+
+    monkeypatch.setenv("TABLE_AWARE_RETRIEVAL", "auto")
+    monkeypatch.setattr(module, "_table_store", _FakeTableStore())
+    monkeypatch.setattr(module, "retrieve_candidate_documents", lambda query, candidate_k=None: {"docs": [doc], "meta": {}})
+    monkeypatch.setattr(
+        module,
+        "finalize_retrieved_documents",
+        lambda query, candidate_docs, final_top_k=None, enable_page_merge=None, adjacent_page_window=None, adjacent_chunk_window=None: {
+            "final_retrieved_docs": [doc],
+            "context_docs": [doc],
+            "meta": {},
+        },
+    )
+
+    result = module.retrieve_documents("What was net sales?", top_k=5)
+
+    assert len(result["context_docs"]) == 1
+    assert "[Evidence 1]" in result["context_docs"][0]["text"]
+    assert "Matched text:" in result["context_docs"][0]["text"]
+    assert "Attached same-page table:" in result["context_docs"][0]["text"]
+    assert result["meta"]["evidence_units_with_tables"] == 1
+    assert "chunk_table_like" in result["meta"]["table_attach_reasons"]
+
+
+def test_retrieve_documents_auto_non_table_query_does_not_force_table_attachment(monkeypatch):
+    module = _install_rag_utils_stubs()
+
+    doc = {
+        "filename": "1.pdf",
+        "doc_name": "1",
+        "page_number": 3,
+        "chunk_id": "c2",
+        "text": "Business overview and strategic priorities.",
+        "type": "chunk",
+        "evidence_type": "text_chunk",
+    }
+
+    class _FakeTableStore:
+        def get_tables_by_filename(self, filename):
+            return [
+                {
+                    "table_id": "t2",
+                    "filename": "1.pdf",
+                    "page_number": 3,
+                    "columns": ["Narrative summary", "Strategic priorities", "Market trends", "Commentary", "Outlook", "Plan"],
+                    "rows": [{"a": "words only", "b": "more words"}],
+                    "csv_text": "words only,more words",
+                    "title": "Chief executive commentary and business outlook",
+                }
+            ]
+
+        def get_tables_by_ids(self, table_ids):
+            return []
+
+    monkeypatch.setenv("TABLE_AWARE_RETRIEVAL", "auto")
+    monkeypatch.setattr(module, "_table_store", _FakeTableStore())
+    monkeypatch.setattr(module, "retrieve_candidate_documents", lambda query, candidate_k=None: {"docs": [doc], "meta": {}})
+    monkeypatch.setattr(
+        module,
+        "finalize_retrieved_documents",
+        lambda query, candidate_docs, final_top_k=None, enable_page_merge=None, adjacent_page_window=None, adjacent_chunk_window=None: {
+            "final_retrieved_docs": [doc],
+            "context_docs": [doc],
+            "meta": {},
+        },
+    )
+
+    result = module.retrieve_documents("Explain Amcor's business.", top_k=5)
+
+    assert result["context_docs"] == [doc]
+    assert result["meta"]["evidence_units_with_tables"] == 0
+    assert result["meta"]["table_context_source"] == "none"

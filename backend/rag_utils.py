@@ -30,6 +30,7 @@ from parent_chunk_store import ParentChunkStore
 from table_context_builder import (
     dedupe_table_ids as _dedupe_table_ids_for_context,
     build_table_context_preview as _build_table_context_preview,
+    format_evidence_unit as _format_evidence_unit,
     truncate_table_context as _truncate_table_context,
 )
 from table_store import TableStore
@@ -142,6 +143,7 @@ def get_table_aware_retrieval_config() -> Dict[str, Any]:
         "max_tables": max(1, _parse_int(os.getenv("TABLE_AWARE_MAX_TABLES"), 3)),
         "max_rows": max(1, _parse_int(os.getenv("TABLE_AWARE_MAX_ROWS"), 8)),
         "max_context_chars": max(200, _parse_int(os.getenv("TABLE_AWARE_MAX_CONTEXT_CHARS"), 4000)),
+        "global_fallback": _parse_bool(os.getenv("TABLE_AWARE_GLOBAL_FALLBACK"), False),
     }
 
 
@@ -470,6 +472,11 @@ def _table_matches_query_anchors(table: dict, query_anchors: List[str]) -> bool:
     return any(_anchor_in_text(anchor, haystack) for anchor in query_anchors)
 
 
+def _query_has_explicit_table_request(query: str) -> bool:
+    lowered = (query or "").lower()
+    return any(term in lowered for term in _TABLE_QUERY_TABLE_HINTS)
+
+
 def _chunk_looks_table_like(text: str) -> bool:
     normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n")
     if not normalized.strip():
@@ -557,6 +564,291 @@ def _build_text_chunk_filter_expr(extra_expr: str = "") -> str:
     if not extra_expr:
         return text_expr
     return f"({extra_expr}) and {text_expr}"
+
+
+def _load_tables_by_filename(filenames: List[str]) -> dict[str, list[dict]]:
+    out: dict[str, list[dict]] = {}
+    for filename in filenames or []:
+        clean_name = (filename or "").strip()
+        if not clean_name or clean_name in out:
+            continue
+        try:
+            out[clean_name] = _table_store.get_tables_by_filename(clean_name) or []
+        except Exception:
+            logger.exception("failed to load tables for filename=%s", clean_name)
+            out[clean_name] = []
+    return out
+
+
+def _build_attached_table_payload(table: dict, include_full: bool, skipped_reason: str = "") -> dict:
+    return {
+        "table": table,
+        "include_full": include_full,
+        "skipped_reason": skipped_reason or "",
+    }
+
+
+def _format_evidence_unit_docs(
+    evidence_units: List[dict],
+    *,
+    max_rows: int,
+    max_context_chars: int,
+) -> tuple[list[dict], int]:
+    if not evidence_units:
+        return [], 0
+
+    out: list[dict] = []
+    total_chars = 0
+    marker = "\n... table evidence truncated ..."
+
+    for index, unit in enumerate(evidence_units, 1):
+        formatted_text = _format_evidence_unit(
+            unit,
+            index=index,
+            preview_rows=max_rows,
+            preview_chars=max_context_chars,
+        )
+        remaining = max_context_chars - total_chars
+        if remaining <= 0:
+            break
+        if len(formatted_text) > remaining:
+            if remaining <= len(marker):
+                break
+            formatted_text = formatted_text[: remaining - len(marker)] + marker
+        matched_chunk = unit.get("matched_chunk") or {}
+        out.append(
+            {
+                **matched_chunk,
+                "filename": unit.get("filename") or matched_chunk.get("filename", ""),
+                "doc_name": matched_chunk.get("doc_name") or get_doc_name(unit.get("filename") or matched_chunk.get("filename", "")),
+                "page_number": unit.get("page_number", matched_chunk.get("page_number", "")),
+                "chunk_id": unit.get("chunk_id") or matched_chunk.get("chunk_id", ""),
+                "type": "evidence_unit",
+                "text": formatted_text,
+                "evidence_type": "evidence_unit",
+                "table_id": "",
+                "row_id": "",
+                "table_title": "",
+            }
+        )
+        total_chars += len(formatted_text)
+        if total_chars >= max_context_chars:
+            break
+    return out, total_chars
+
+
+def _build_evidence_units(
+    query: str,
+    context_docs: List[dict],
+    final_retrieved_docs: List[dict],
+) -> tuple[list[dict] | None, dict]:
+    config = get_table_aware_retrieval_config()
+    source_docs = list(context_docs or [])
+    reference_docs = list(final_retrieved_docs or [])
+    combined_docs = _deduplicate_docs(source_docs + reference_docs)
+    query_anchors = extract_query_anchors(query)
+    candidate_filenames = _extract_table_candidate_filenames(
+        combined_docs,
+        query_anchors=query_anchors,
+        max_files=config["max_candidate_docs"],
+    )
+    candidate_pages = _extract_table_candidate_pages(source_docs)
+    should_enable, auto_triggered, trigger_reasons = _should_enable_table_aware_retrieval(
+        query,
+        combined_docs,
+        config["mode"],
+    )
+    query_triggered, _ = _query_triggers_table_aware_retrieval(query)
+    skipped_reasons: list[str] = []
+    base_meta = {
+        "table_aware_retrieval_mode": config["mode"],
+        "table_aware_auto_triggered": auto_triggered,
+        "table_aware_trigger_reason": trigger_reasons,
+        "query_anchors": query_anchors,
+        "anchor_guard_applied": False,
+        "anchor_filtered_count": 0,
+        "table_context_source": "none",
+        "table_evidence_hit_count": 0,
+        "table_context_table_count": 0,
+        "table_context_char_count": 0,
+        "table_candidate_filenames": candidate_filenames,
+        "table_candidate_pages": candidate_pages,
+        "table_ids": [],
+        "table_context_skipped_reasons": skipped_reasons,
+        "evidence_unit_count": 0,
+        "evidence_units_with_tables": 0,
+        "table_attached_count": 0,
+        "table_attach_reasons": [],
+    }
+    if config["mode"] == "off":
+        return None, base_meta
+    if not should_enable:
+        _append_skip_reason(skipped_reasons, "non_table_query")
+        return None, base_meta
+
+    explicit_table_request = _query_has_explicit_table_request(query)
+    anchor_filename_hits = _build_anchor_matched_filename_stats(combined_docs, query_anchors)
+    table_cache = _load_tables_by_filename([doc.get("filename") or "" for doc in combined_docs])
+
+    evidence_units: list[dict] = []
+    attached_table_ids: list[str] = []
+    attached_table_seen: set[str] = set()
+    table_attach_reasons: list[str] = []
+    anchor_guard_applied = False
+    anchor_filtered_count = 0
+    source = "none"
+
+    for doc in source_docs:
+        filename = (doc.get("filename") or "").strip()
+        page_number = _coerce_int(doc.get("page_number"))
+        unit = {
+            "matched_chunk": doc,
+            "filename": filename,
+            "page_number": doc.get("page_number", ""),
+            "chunk_id": doc.get("chunk_id", ""),
+            "text": doc.get("text", "") or "",
+            "attached_tables": [],
+            "table_attach_reason": "none",
+        }
+        if filename and page_number is not None:
+            same_page_tables = [
+                table
+                for table in (table_cache.get(filename) or [])
+                if _coerce_int(table.get("page_number")) == page_number
+            ]
+            if same_page_tables:
+                filtered_tables, _, table_anchor_applied, table_anchor_filtered = _apply_anchor_guard_to_tables(
+                    same_page_tables,
+                    [doc],
+                    combined_docs,
+                    query_anchors,
+                )
+                anchor_guard_applied = anchor_guard_applied or table_anchor_applied
+                anchor_filtered_count += table_anchor_filtered
+                same_page_tables = filtered_tables
+                chunk_table_like = _chunk_looks_table_like(doc.get("text", "") or "")
+                attach_reason = "none"
+                if chunk_table_like:
+                    attach_reason = "chunk_table_like"
+                elif explicit_table_request:
+                    attach_reason = "query_explicit_table_request"
+                elif config["mode"] == "force":
+                    attach_reason = "same_page_high_quality_table"
+
+                if same_page_tables and attach_reason != "none":
+                    for table in same_page_tables:
+                        table_id = (table.get("table_id") or "").strip()
+                        is_full, rejected_reason = _table_quality_guard(table)
+                        unit["attached_tables"].append(
+                            _build_attached_table_payload(
+                                table,
+                                include_full=is_full,
+                                skipped_reason=rejected_reason or "table_quality_rejected",
+                            )
+                        )
+                        if table_id and table_id not in attached_table_seen:
+                            attached_table_seen.add(table_id)
+                            attached_table_ids.append(table_id)
+                    unit["table_attach_reason"] = attach_reason
+                    source = source if source != "none" else "same_page_table"
+                    if attach_reason not in table_attach_reasons:
+                        table_attach_reasons.append(attach_reason)
+        evidence_units.append(unit)
+
+    if not attached_table_ids:
+        if not candidate_filenames:
+            _append_skip_reason(skipped_reasons, "no_candidate_documents")
+        if config["mode"] == "force" or (config["mode"] == "auto" and query_triggered):
+            allow_global_fallback = bool(config.get("global_fallback")) and not candidate_filenames
+            if candidate_filenames or allow_global_fallback:
+                filter_expr = _build_table_evidence_filter_expr(candidate_filenames)
+                dense_embeddings, sparse_embeddings = _embedding_service.get_all_embeddings([query])
+                search_hits = _milvus_manager.hybrid_retrieve(
+                    dense_embedding=dense_embeddings[0],
+                    sparse_embedding=sparse_embeddings[0],
+                    top_k=config["top_k"],
+                    filter_expr=filter_expr,
+                )
+                search_table_ids = _dedupe_table_ids_for_context(search_hits)[: config["max_tables"]]
+                candidate_tables = _table_store.get_tables_by_ids(search_table_ids) if search_table_ids else []
+                if candidate_filenames:
+                    candidate_filename_set = set(candidate_filenames)
+                    candidate_tables = [
+                        table for table in candidate_tables if (table.get("filename") or "") in candidate_filename_set
+                    ]
+                filtered_tables, filtered_hits, table_anchor_applied, table_anchor_filtered = _apply_anchor_guard_to_tables(
+                    candidate_tables,
+                    search_hits,
+                    combined_docs,
+                    query_anchors,
+                )
+                anchor_guard_applied = anchor_guard_applied or table_anchor_applied
+                anchor_filtered_count += table_anchor_filtered
+                if filtered_tables:
+                    source = "document_scoped_search" if candidate_filenames else "global_fallback"
+                    evidence_by_filename: dict[str, list[dict]] = {}
+                    for table in filtered_tables[: config["max_tables"]]:
+                        filename = (table.get("filename") or "").strip()
+                        evidence_by_filename.setdefault(filename, []).append(table)
+                    for unit in evidence_units:
+                        filename = (unit.get("filename") or "").strip()
+                        unit_tables = evidence_by_filename.get(filename, [])
+                        if not unit_tables:
+                            continue
+                        attach_reason = "query_explicit_table_request" if explicit_table_request else "same_page_high_quality_table"
+                        for table in unit_tables:
+                            table_id = (table.get("table_id") or "").strip()
+                            is_full, rejected_reason = _table_quality_guard(table)
+                            unit["attached_tables"].append(
+                                _build_attached_table_payload(
+                                    table,
+                                    include_full=is_full,
+                                    skipped_reason=rejected_reason or "table_quality_rejected",
+                                )
+                            )
+                            if table_id and table_id not in attached_table_seen:
+                                attached_table_seen.add(table_id)
+                                attached_table_ids.append(table_id)
+                        if unit_tables:
+                            unit["table_attach_reason"] = attach_reason
+                            if attach_reason not in table_attach_reasons:
+                                table_attach_reasons.append(attach_reason)
+                    if not attached_table_ids:
+                        _append_skip_reason(skipped_reasons, "no_valid_table_candidates")
+                    table_evidence_hit_count = len(filtered_hits)
+                else:
+                    _append_skip_reason(skipped_reasons, "anchor_guard_filtered" if table_anchor_filtered else "no_valid_table_candidates")
+                    table_evidence_hit_count = 0
+            else:
+                _append_skip_reason(skipped_reasons, "no_candidate_documents")
+
+    if not attached_table_ids:
+        if not any(unit.get("attached_tables") for unit in evidence_units):
+            _append_skip_reason(skipped_reasons, "no_valid_table_candidates")
+
+    formatted_docs, total_chars = _format_evidence_unit_docs(
+        evidence_units,
+        max_rows=config["max_rows"],
+        max_context_chars=config["max_context_chars"],
+    )
+
+    meta = {
+        **base_meta,
+        "anchor_guard_applied": anchor_guard_applied,
+        "anchor_filtered_count": anchor_filtered_count,
+        "table_context_source": source,
+        "table_evidence_hit_count": len(attached_table_ids) if attached_table_ids else 0,
+        "table_context_table_count": len(attached_table_seen),
+        "table_context_char_count": total_chars,
+        "table_ids": attached_table_ids,
+        "evidence_unit_count": len(evidence_units),
+        "evidence_units_with_tables": sum(1 for unit in evidence_units if unit.get("attached_tables")),
+        "table_attached_count": sum(len(unit.get("attached_tables") or []) for unit in evidence_units),
+        "table_attach_reasons": table_attach_reasons,
+    }
+    if not any(unit.get("attached_tables") for unit in evidence_units):
+        return None, meta
+    return formatted_docs or None, meta
 
 
 def _is_retrieved_table_evidence(doc: dict) -> bool:
@@ -2339,6 +2631,7 @@ def retrieve_documents(
     apply_page_merge: bool | None = None,
 ) -> Dict[str, Any]:
     started_at = time.perf_counter()
+    table_aware_config = get_table_aware_retrieval_config()
     candidates = retrieve_candidate_documents(query, candidate_k=candidate_k)
     finalized = finalize_retrieved_documents(
         query,
@@ -2347,12 +2640,13 @@ def retrieve_documents(
         enable_page_merge=apply_page_merge,
     )
     context_docs = list(finalized.get("context_docs", []) or [])
-    table_context_doc, table_context_meta = _build_table_context_doc(
+    evidence_unit_docs, table_context_meta = _build_evidence_units(
         query,
+        context_docs,
         finalized.get("final_retrieved_docs", []) or [],
     )
-    if table_context_doc:
-        context_docs.append(table_context_doc)
+    if table_aware_config["mode"] != "off" and evidence_unit_docs:
+        context_docs = evidence_unit_docs
     meta = {**candidates.get("meta", {}), **finalized.get("meta", {}), **table_context_meta}
     meta["latency_breakdown"] = {
         **(candidates.get("meta", {}).get("latency_breakdown", {}) or {}),
@@ -2404,6 +2698,10 @@ def debug_retrieval_pipeline(question: str, top_k: int = 10) -> Dict[str, Any]:
             "table_evidence_hit_count": meta.get("table_evidence_hit_count", 0),
             "table_context_table_count": meta.get("table_context_table_count", 0),
             "table_context_char_count": meta.get("table_context_char_count", 0),
+            "evidence_unit_count": meta.get("evidence_unit_count", 0),
+            "evidence_units_with_tables": meta.get("evidence_units_with_tables", 0),
+            "table_attached_count": meta.get("table_attached_count", 0),
+            "table_attach_reasons": meta.get("table_attach_reasons", []) or [],
             "table_candidate_filenames": meta.get("table_candidate_filenames", []) or [],
             "table_candidate_pages": meta.get("table_candidate_pages", []) or [],
             "table_ids": meta.get("table_ids", []) or [],

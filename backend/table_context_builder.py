@@ -163,3 +163,42 @@ def truncate_table_context(text: str, max_chars: int) -> str:
     if max_chars <= len(marker):
         return marker[:max_chars]
     return cleaned[: max_chars - len(marker)] + marker
+
+
+def format_evidence_unit(
+    unit: dict,
+    *,
+    index: int,
+    preview_rows: int,
+    preview_chars: int,
+) -> str:
+    filename = _clean_text(unit.get("filename")) or _clean_text((unit.get("matched_chunk") or {}).get("filename"))
+    page_number = unit.get("page_number", "")
+    matched_text = _clean_text(unit.get("text")) or _clean_text((unit.get("matched_chunk") or {}).get("text"))
+    lines = [
+        f"[Evidence {index}]",
+        f"Source: {filename}, page {page_number}",
+        "Matched text:",
+        matched_text or "(none)",
+    ]
+
+    for attached in unit.get("attached_tables") or []:
+        table = attached.get("table") if isinstance(attached, dict) else attached
+        if not isinstance(table, dict):
+            continue
+        include_full = bool(attached.get("include_full", True)) if isinstance(attached, dict) else True
+        skipped_reason = _clean_text(attached.get("skipped_reason")) if isinstance(attached, dict) else ""
+        lines.append("Attached same-page table:")
+        lines.append(
+            format_table_preview(
+                table,
+                preview_rows=preview_rows,
+                preview_chars=preview_chars,
+                include_rows=include_full,
+                include_csv=include_full,
+            )
+        )
+        if not include_full:
+            lines.append(f"(table preview limited: {skipped_reason or 'table_quality_rejected'})")
+
+    return "\n".join(lines)

@@ -3,6 +3,7 @@ from backend.table_context_builder import (
     build_table_context_preview as _build_preview,
     dedupe_table_ids,
     fetch_tables_for_results,
+    format_evidence_unit,
     format_table_preview,
     group_hits_by_table_id,
 )
@@ -114,3 +115,35 @@ def test_no_table_evidence_returns_empty_results_without_error():
 
     assert tables == []
     assert preview == ""
+
+
+def test_format_evidence_unit_contains_matched_text_and_attached_table_preview():
+    text = format_evidence_unit(
+        {
+            "filename": "demo.pdf",
+            "page_number": 8,
+            "text": "Net sales 3,909 3,673 14,544 14,694",
+            "attached_tables": [
+                {
+                    "table": {
+                        "table_id": "t1",
+                        "filename": "demo.pdf",
+                        "page_number": 8,
+                        "columns": ["Metric", "2023", "2022"],
+                        "rows": [{"Metric": "Net sales", "2023": "3,909", "2022": "3,673"}],
+                        "csv_text": "Metric,2023,2022\nNet sales,3,909,3,673",
+                    },
+                    "include_full": True,
+                    "skipped_reason": "",
+                }
+            ],
+        },
+        index=1,
+        preview_rows=5,
+        preview_chars=1200,
+    )
+
+    assert "[Evidence 1]" in text
+    assert "Matched text:" in text
+    assert "Attached same-page table:" in text
+    assert "Table ID: t1" in text
