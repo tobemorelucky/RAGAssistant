@@ -151,6 +151,24 @@ def test_table_aware_retrieval_auto_business_query_does_not_trigger(monkeypatch)
     assert doc is None
     assert meta["table_aware_auto_triggered"] is False
     assert meta["table_aware_trigger_reason"] == []
+    assert meta["table_context_skipped_reasons"] == ["non_table_query"]
+
+
+def test_table_aware_retrieval_auto_date_only_query_does_not_trigger(monkeypatch):
+    module = _install_rag_utils_stubs()
+
+    class _FailMilvus:
+        def hybrid_retrieve(self, **kwargs):
+            raise AssertionError("date-only event query should not trigger table evidence retrieval")
+
+    monkeypatch.setattr(module, "_milvus_manager", _FailMilvus())
+    monkeypatch.setenv("TABLE_AWARE_RETRIEVAL", "auto")
+
+    doc, meta = module._build_table_context_doc("What happened from August 30, 2023 onward?")
+
+    assert doc is None
+    assert meta["table_aware_auto_triggered"] is False
+    assert meta["table_context_skipped_reasons"] == ["non_table_query"]
 
 
 def test_table_aware_retrieval_auto_retrieved_table_like_chunk_triggers(monkeypatch):
@@ -216,7 +234,7 @@ def test_table_aware_retrieval_force_dedupes_ids_and_limits_tables(monkeypatch):
     assert meta["table_evidence_hit_count"] == 4
     assert meta["table_context_table_count"] == 1
     assert meta["table_ids"] == ["t1"]
-    assert meta["table_context_source"] == "document_scoped_search"
+    assert meta["table_context_source"] == "global_fallback"
     assert "Additional structured table evidence:" in doc["text"]
 
 
@@ -251,19 +269,21 @@ def test_table_aware_retrieval_uses_candidate_filename_filter(monkeypatch):
 def test_table_aware_retrieval_candidate_filenames_are_ranked_deduped_and_limited(monkeypatch):
     module = _install_rag_utils_stubs()
     monkeypatch.setenv("TABLE_AWARE_RETRIEVAL", "force")
+    monkeypatch.setenv("TABLE_AWARE_MAX_CANDIDATE_DOCS", "3")
 
     filenames = module._extract_table_candidate_filenames(
         [
-            {"filename": "AES_2022_10K.pdf"},
+            {"filename": "1.pdf", "score": 0.95},
+            {"filename": "2.pdf", "score": 0.70},
+            {"filename": "2.pdf", "score": 0.80},
+            {"filename": "2.pdf", "score": 0.60},
             {"filename": "ADOBE_2022_10K.pdf"},
-            {"filename": "ADOBE_2022_10K.pdf"},
-            {"filename": "ADOBE_2021_10K.pdf"},
-            {"filename": "EXTRA.pdf"},
+            {"filename": "3.pdf", "score": 0.85},
         ],
-        max_files=2,
+        max_files=3,
     )
 
-    assert filenames == ["ADOBE_2022_10K.pdf", "AES_2022_10K.pdf"]
+    assert filenames == ["2.pdf", "1.pdf", "ADOBE_2022_10K.pdf"]
 
 
 def test_table_aware_retrieval_falls_back_to_global_when_no_candidate_filenames(monkeypatch):
@@ -396,6 +416,81 @@ def test_table_aware_retrieval_auto_document_scoped_fallback_requires_query_trig
 
     assert doc is None
     assert meta["table_context_source"] == "none"
+    assert "non_table_query" in meta["table_context_skipped_reasons"]
+
+
+def test_table_aware_retrieval_global_fallback_only_when_no_candidate_documents(monkeypatch):
+    module = _install_rag_utils_stubs()
+
+    class _FakeMilvus:
+        def hybrid_retrieve(self, **kwargs):
+            assert kwargs["filter_expr"] == 'evidence_type != "text_chunk"'
+            return [
+                {"table_id": "t1", "score": 0.9, "text": "row one", "evidence_type": "table_row", "row_id": "row_1", "page_number": 8}
+            ]
+
+    class _FakeTableStore:
+        def get_tables_by_ids(self, table_ids):
+            return [
+                {"table_id": "t1", "filename": "1.pdf", "page_number": 8, "columns": ["Metric"], "rows": [{"Metric": "Net sales"}], "csv_text": ""}
+            ]
+
+        def get_tables_by_filename(self, filename):
+            return []
+
+    monkeypatch.setattr(module, "_milvus_manager", _FakeMilvus())
+    monkeypatch.setattr(module, "_table_store", _FakeTableStore())
+    monkeypatch.setenv("TABLE_AWARE_RETRIEVAL", "force")
+
+    doc, meta = module._build_table_context_doc("What was revenue?", retrieved_docs=[])
+
+    assert doc is not None
+    assert meta["table_context_source"] == "global_fallback"
+
+
+def test_table_aware_retrieval_quality_guard_skips_full_rows_for_bad_table(monkeypatch):
+    module = _install_rag_utils_stubs()
+
+    class _FailMilvus:
+        def hybrid_retrieve(self, **kwargs):
+            raise AssertionError("should not search when same-page candidate exists")
+
+    class _FakeTableStore:
+        def get_tables_by_ids(self, table_ids):
+            return []
+
+        def get_tables_by_filename(self, filename):
+            return [
+                {
+                    "table_id": "bad::table::1",
+                    "filename": filename,
+                    "page_number": 4,
+                    "title": "Chief executive officer commentary on strategic priorities and market conditions",
+                    "columns": [
+                        "Chief executive officer commentary on strategic priorities",
+                        "market conditions and demand trends",
+                        "portfolio simplification update",
+                        "capital allocation overview",
+                        "sustainability roadmap progress",
+                        "regional operating context summary",
+                    ],
+                    "rows": [{"a": "narrative only", "b": "words only"}],
+                    "csv_text": "narrative only,words only",
+                }
+            ]
+
+    monkeypatch.setattr(module, "_milvus_manager", _FailMilvus())
+    monkeypatch.setattr(module, "_table_store", _FakeTableStore())
+    monkeypatch.setenv("TABLE_AWARE_RETRIEVAL", "auto")
+
+    doc, meta = module._build_table_context_doc(
+        "What was revenue growth?",
+        retrieved_docs=[{"filename": "1.pdf", "page_number": 4, "text": "Revenue 10 11 12\nCost of sales 5 6 7"}],
+    )
+
+    assert doc is not None
+    assert "table_quality_rejected" in meta["table_context_skipped_reasons"]
+    assert "(skipped: table_quality_rejected)" in doc["text"]
 
 
 def test_table_context_respects_max_context_chars(monkeypatch):
@@ -467,6 +562,7 @@ def test_debug_retrieval_pipeline_exposes_table_aware_trace_fields(monkeypatch):
                 "table_candidate_filenames": ["demo.pdf"],
                 "table_candidate_pages": [{"filename": "demo.pdf", "page_number": 8}],
                 "table_ids": ["t1"],
+                "table_context_skipped_reasons": ["table_quality_rejected"],
                 "latency_breakdown": {"total_retrieval_ms": 12.3},
             },
         },
@@ -485,3 +581,4 @@ def test_debug_retrieval_pipeline_exposes_table_aware_trace_fields(monkeypatch):
     assert trace["table_candidate_filenames"] == ["demo.pdf"]
     assert trace["table_candidate_pages"] == [{"filename": "demo.pdf", "page_number": 8}]
     assert trace["table_ids"] == ["t1"]
+    assert trace["table_context_skipped_reasons"] == ["table_quality_rejected"]

@@ -61,7 +61,14 @@ def _row_preview(rows: Iterable[dict], max_rows: int) -> list[str]:
     return preview
 
 
-def format_table_preview(table: dict, *, preview_rows: int, preview_chars: int) -> str:
+def format_table_preview(
+    table: dict,
+    *,
+    preview_rows: int,
+    preview_chars: int,
+    include_rows: bool = True,
+    include_csv: bool = True,
+) -> str:
     table_id = _clean_text(table.get("table_id"))
     filename = _clean_text(table.get("filename"))
     page_number = table.get("page_number", "")
@@ -78,10 +85,10 @@ def format_table_preview(table: dict, *, preview_rows: int, preview_chars: int) 
     if title:
         lines.append(f"Title: {title}")
     lines.append(f"columns: {columns}")
-    if rows_preview:
+    if include_rows and rows_preview:
         lines.append("rows:")
         lines.extend(rows_preview)
-    if csv_preview:
+    if include_csv and csv_preview:
         lines.append("csv_text:")
         lines.append(csv_preview)
     return "\n".join(lines)
@@ -108,22 +115,43 @@ def build_table_context_preview(
     *,
     preview_rows: int,
     preview_chars: int,
+    full_table_ids: set[str] | None = None,
+    skipped_table_reasons: dict[str, str] | None = None,
 ) -> str:
     grouped_hits = group_hits_by_table_id(results)
     lines = []
     for table in tables or []:
         table_id = _clean_text(table.get("table_id"))
         hits = grouped_hits.get(table_id, [])
+        include_full = full_table_ids is None or table_id in full_table_ids
+        skipped_reason = _clean_text((skipped_table_reasons or {}).get(table_id))
         lines.extend(
             [
                 "[Table Evidence]",
-                format_table_preview(table, preview_rows=preview_rows, preview_chars=preview_chars),
+                format_table_preview(
+                    table,
+                    preview_rows=preview_rows,
+                    preview_chars=preview_chars,
+                    include_rows=False,
+                    include_csv=False,
+                ),
                 "Matched Evidence:",
                 format_matched_evidence_hits(hits, preview_chars=preview_chars) or "(none)",
                 "Full Table:",
-                format_table_preview(table, preview_rows=preview_rows, preview_chars=preview_chars),
             ]
         )
+        if include_full:
+            lines.append(
+                format_table_preview(
+                    table,
+                    preview_rows=preview_rows,
+                    preview_chars=preview_chars,
+                    include_rows=True,
+                    include_csv=True,
+                )
+            )
+        else:
+            lines.append(f"(skipped: {skipped_reason or 'table_quality_rejected'})")
     return "\n".join(lines)
 
 

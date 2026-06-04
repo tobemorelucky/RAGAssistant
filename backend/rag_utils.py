@@ -24,7 +24,7 @@ from finance_rag_features import (
     normalize_doc_name,
     parse_finance_query,
 )
-from query_parser import company_aliases_for, matches_company_text
+from query_parser import matches_company_text
 from milvus_client import MilvusManager
 from parent_chunk_store import ParentChunkStore
 from table_context_builder import (
@@ -138,6 +138,7 @@ def get_table_aware_retrieval_config() -> Dict[str, Any]:
     return {
         "mode": _parse_table_aware_retrieval_mode(os.getenv("TABLE_AWARE_RETRIEVAL")),
         "top_k": max(1, _parse_int(os.getenv("TABLE_AWARE_EVIDENCE_TOP_K"), 5)),
+        "max_candidate_docs": max(1, _parse_int(os.getenv("TABLE_AWARE_MAX_CANDIDATE_DOCS"), 3)),
         "max_tables": max(1, _parse_int(os.getenv("TABLE_AWARE_MAX_TABLES"), 3)),
         "max_rows": max(1, _parse_int(os.getenv("TABLE_AWARE_MAX_ROWS"), 8)),
         "max_context_chars": max(200, _parse_int(os.getenv("TABLE_AWARE_MAX_CONTEXT_CHARS"), 4000)),
@@ -262,20 +263,10 @@ def _retrieved_docs_trigger_table_aware_retrieval(docs: List[dict]) -> tuple[boo
     return False, []
 
 
-def _matches_query_company_filename(filename: str, query_parse: dict | None) -> bool:
-    company = ((query_parse or {}).get("company") or "").strip()
-    if not company or not filename:
-        return False
-    filename_text = filename.replace("_", " ").replace("-", " ").lower()
-    aliases = [company.lower(), *[alias.lower() for alias in company_aliases_for(company)]]
-    return any(alias and alias in filename_text for alias in aliases)
-
-
 def _extract_table_candidate_filenames(
     docs: List[dict],
     *,
-    query_parse: dict | None = None,
-    max_files: int = 2,
+    max_files: int = 3,
 ) -> list[str]:
     ranked: dict[str, dict[str, Any]] = {}
     for rank, doc in enumerate(docs or [], 1):
@@ -288,18 +279,19 @@ def _extract_table_candidate_filenames(
                 "filename": filename,
                 "count": 0,
                 "first_rank": rank,
-                "company_match": _matches_query_company_filename(filename, query_parse),
+                "best_score": _combined_score(doc),
             },
         )
         item["count"] += 1
         item["first_rank"] = min(item["first_rank"], rank)
+        item["best_score"] = max(item["best_score"], _combined_score(doc))
 
     ordered = sorted(
         ranked.values(),
         key=lambda item: (
-            -int(bool(item["company_match"])),
             -int(item["count"]),
             int(item["first_rank"]),
+            -float(item["best_score"]),
         ),
     )
     return [item["filename"] for item in ordered[: max(1, max_files)]]
@@ -422,6 +414,55 @@ def _build_same_page_table_hits(tables: List[dict], docs: List[dict]) -> list[di
                 }
             )
     return hits
+
+
+def _is_sentence_like_cell(text: str) -> bool:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return False
+    if _count_numeric_values(cleaned) > 0:
+        return False
+    words = re.findall(r"[A-Za-z]+", cleaned)
+    return len(words) >= 5
+
+
+def _table_quality_guard(table: dict) -> tuple[bool, str]:
+    columns = [str(item).strip() for item in (table.get("columns") or []) if str(item).strip()]
+    rows = table.get("rows") or []
+    title = ((table.get("title") or "") or (table.get("caption") or "")).strip()
+    effective_col_count = len(columns)
+    data_row_count = len(rows)
+
+    if effective_col_count >= 8 and data_row_count <= 1:
+        return False, "table_quality_rejected"
+
+    sentence_like_columns = sum(1 for col in columns if _is_sentence_like_cell(col))
+    if effective_col_count >= 4 and sentence_like_columns >= max(3, effective_col_count // 2):
+        return False, "table_quality_rejected"
+
+    numeric_cells = 0
+    non_empty_cells = 0
+    for row in rows[:8]:
+        values = row.values() if isinstance(row, dict) else row
+        for value in values:
+            text = str(value).strip()
+            if not text:
+                continue
+            non_empty_cells += 1
+            if _count_numeric_values(text) > 0:
+                numeric_cells += 1
+    if non_empty_cells > 0 and effective_col_count >= 3 and (numeric_cells / non_empty_cells) < 0.12:
+        return False, "table_quality_rejected"
+
+    if title and _is_sentence_like_cell(title) and effective_col_count >= 6 and data_row_count <= 2:
+        return False, "table_quality_rejected"
+
+    return True, ""
+
+
+def _append_skip_reason(reasons: list[str], reason: str) -> None:
+    if reason and reason not in reasons:
+        reasons.append(reason)
 
 
 def _should_enable_table_aware_retrieval(query: str, retrieved_docs: List[dict], mode: str) -> tuple[bool, bool, list[str]]:
@@ -1641,11 +1682,9 @@ def _build_table_context_doc(query: str, retrieved_docs: List[dict] | None = Non
     config = get_table_aware_retrieval_config()
     retrieved_docs = list(retrieved_docs or [])
     query_triggered, query_trigger_reasons = _query_triggers_table_aware_retrieval(query)
-    query_parse = parse_finance_query(query)
     candidate_filenames = _extract_table_candidate_filenames(
         retrieved_docs,
-        query_parse=query_parse,
-        max_files=2,
+        max_files=config["max_candidate_docs"],
     )
     candidate_pages = _extract_table_candidate_pages(retrieved_docs)
     should_enable, auto_triggered, trigger_reasons = _should_enable_table_aware_retrieval(
@@ -1653,6 +1692,7 @@ def _build_table_context_doc(query: str, retrieved_docs: List[dict] | None = Non
         retrieved_docs,
         config["mode"],
     )
+    skipped_reasons: list[str] = []
     base_meta = {
         "table_aware_retrieval_mode": config["mode"],
         "table_aware_auto_triggered": auto_triggered,
@@ -1664,8 +1704,10 @@ def _build_table_context_doc(query: str, retrieved_docs: List[dict] | None = Non
         "table_candidate_filenames": candidate_filenames,
         "table_candidate_pages": candidate_pages,
         "table_ids": [],
+        "table_context_skipped_reasons": skipped_reasons,
     }
     if not should_enable:
+        _append_skip_reason(skipped_reasons, "non_table_query")
         return None, base_meta
 
     try:
@@ -1674,6 +1716,8 @@ def _build_table_context_doc(query: str, retrieved_docs: List[dict] | None = Non
         tables: list[dict] = []
         table_ids: list[str] = []
         table_evidence_hit_count = 0
+        full_table_ids: set[str] = set()
+        skipped_table_reasons: dict[str, str] = {}
 
         retrieved_table_ids = _extract_retrieved_table_ids(retrieved_docs, config["max_tables"])
         if retrieved_table_ids:
@@ -1686,6 +1730,9 @@ def _build_table_context_doc(query: str, retrieved_docs: List[dict] | None = Non
                 table_evidence_hit_count = len(hits)
                 source = "retrieved_table_chunk"
 
+        if not table_ids and not candidate_pages:
+            _append_skip_reason(skipped_reasons, "no_table_like_chunks")
+
         if not table_ids and candidate_pages:
             candidate_tables = _fetch_tables_for_candidate_pages(candidate_pages, config["max_tables"])
             if candidate_tables:
@@ -1694,6 +1741,8 @@ def _build_table_context_doc(query: str, retrieved_docs: List[dict] | None = Non
                 hits = _build_same_page_table_hits(tables, retrieved_docs)
                 table_evidence_hit_count = len(hits)
                 source = "same_page_table"
+            else:
+                _append_skip_reason(skipped_reasons, "no_valid_same_page_tables")
 
         if not table_ids and (config["mode"] == "force" or (config["mode"] == "auto" and query_triggered)):
             filter_expr = _build_table_evidence_filter_expr(candidate_filenames)
@@ -1716,13 +1765,30 @@ def _build_table_context_doc(query: str, retrieved_docs: List[dict] | None = Non
                 table_ids = [table.get("table_id", "") for table in tables if table.get("table_id")]
                 hits = [hit for hit in selected_hits if (hit.get("table_id") or "") in set(table_ids)]
                 table_evidence_hit_count = len(search_hits)
-                source = "document_scoped_search"
+                source = "document_scoped_search" if candidate_filenames else "global_fallback"
+            else:
+                _append_skip_reason(skipped_reasons, "no_valid_table_evidence")
+        elif not table_ids and not candidate_filenames:
+            _append_skip_reason(skipped_reasons, "no_candidate_documents")
+
+        for table in tables:
+            table_id = (table.get("table_id") or "").strip()
+            if not table_id:
+                continue
+            is_full, rejected_reason = _table_quality_guard(table)
+            if is_full:
+                full_table_ids.add(table_id)
+            else:
+                skipped_table_reasons[table_id] = rejected_reason or "table_quality_rejected"
+                _append_skip_reason(skipped_reasons, "table_quality_rejected")
 
         table_context = _build_table_context_preview(
             hits,
             tables,
             preview_rows=config["max_rows"],
             preview_chars=config["max_context_chars"],
+            full_table_ids=full_table_ids,
+            skipped_table_reasons=skipped_table_reasons,
         )
         table_context = _truncate_table_context(table_context, config["max_context_chars"])
         meta = {
@@ -2032,6 +2098,7 @@ def debug_retrieval_pipeline(question: str, top_k: int = 10) -> Dict[str, Any]:
             "table_candidate_filenames": meta.get("table_candidate_filenames", []) or [],
             "table_candidate_pages": meta.get("table_candidate_pages", []) or [],
             "table_ids": meta.get("table_ids", []) or [],
+            "table_context_skipped_reasons": meta.get("table_context_skipped_reasons", []) or [],
             "two_stage_retrieval": meta.get("two_stage_retrieval", False),
             "selected_docs": meta.get("selected_docs", []) or meta.get("doc_stage_selected_docs", []) or [],
             "selected_pages": meta.get("selected_pages", []) or [],
