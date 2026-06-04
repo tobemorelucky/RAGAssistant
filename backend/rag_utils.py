@@ -28,6 +28,10 @@ from query_parser import matches_company_text
 from query_planner import plan_retrieval_queries
 from milvus_client import MilvusManager
 from parent_chunk_store import ParentChunkStore
+from evidence_group_builder import (
+    build_group_debug_payload as _build_group_debug_payload,
+    format_evidence_group as _format_evidence_group,
+)
 from table_context_builder import (
     dedupe_table_ids as _dedupe_table_ids_for_context,
     build_table_context_preview as _build_table_context_preview,
@@ -145,6 +149,16 @@ def get_table_aware_retrieval_config() -> Dict[str, Any]:
         "max_rows": max(1, _parse_int(os.getenv("TABLE_AWARE_MAX_ROWS"), 8)),
         "max_context_chars": max(200, _parse_int(os.getenv("TABLE_AWARE_MAX_CONTEXT_CHARS"), 4000)),
         "global_fallback": _parse_bool(os.getenv("TABLE_AWARE_GLOBAL_FALLBACK"), False),
+    }
+
+
+def get_evidence_group_config() -> Dict[str, Any]:
+    return {
+        "enabled": _parse_bool(os.getenv("RAG_EVIDENCE_GROUPING_ENABLED"), True),
+        "max_groups": max(1, _parse_int(os.getenv("RAG_MAX_EVIDENCE_GROUPS"), 5)),
+        "max_snippets_per_group": max(1, _parse_int(os.getenv("RAG_MAX_SNIPPETS_PER_GROUP"), 3)),
+        "max_table_rows_per_group": max(1, _parse_int(os.getenv("RAG_MAX_TABLE_ROWS_PER_GROUP"), 5)),
+        "max_chars_per_group": max(200, _parse_int(os.getenv("RAG_MAX_CHARS_PER_GROUP"), 1200)),
     }
 
 
@@ -636,6 +650,483 @@ def _format_evidence_unit_docs(
         if total_chars >= max_context_chars:
             break
     return out, total_chars
+
+
+def _collect_planner_terms(meta: dict | None) -> set[str]:
+    meta = meta or {}
+    terms: set[str] = set()
+    for field in (
+        "planner_semantic_queries",
+        "planner_evidence_field_queries",
+        "planner_table_heading_queries",
+        "planner_keyword_queries",
+        "planner_must_keep_terms",
+    ):
+        for value in meta.get(field, []) or []:
+            terms |= _extract_keyword_tokens(str(value))
+            terms |= _extract_metric_hints(str(value))
+            terms |= _fallback_query_terms(str(value))
+    return terms
+
+
+def _doc_text_overlap_score(text: str, *, query_terms: set[str], planner_terms: set[str], query_numbers: set[str], query_years: set[str]) -> float:
+    text_terms = _extract_keyword_tokens(text) | _extract_metric_hints(text) | _fallback_query_terms(text)
+    text_metrics = _extract_metric_hints(text)
+    text_numbers = _extract_numbers(text) | set(_TABLE_NUMERIC_PATTERN.findall(text or ""))
+    text_years = _extract_years(text) | set(_TABLE_YEAR_PATTERN.findall(text or ""))
+    score = 0.0
+    if query_terms:
+        score += len(text_terms & query_terms) / max(1, len(query_terms))
+    if planner_terms:
+        score += 0.8 * (len((text_terms | text_metrics) & planner_terms) / max(1, len(planner_terms)))
+    if query_numbers:
+        score += 0.8 * (len(text_numbers & query_numbers) / max(1, len(query_numbers)))
+    if query_years:
+        score += 0.8 * (len(text_years & query_years) / max(1, len(query_years)))
+    return score
+
+
+def _table_row_preview_text(row: dict) -> str:
+    parts = []
+    for key, value in (row or {}).items():
+        if str(key).startswith("_"):
+            continue
+        key_text = str(key).strip()
+        value_text = str(value).strip()
+        if key_text and value_text:
+            parts.append(f"{key_text}: {value_text}")
+    return "; ".join(parts)
+
+
+def _select_relevant_table_rows(
+    table: dict,
+    *,
+    query_terms: set[str],
+    planner_terms: set[str],
+    query_numbers: set[str],
+    query_years: set[str],
+    max_rows: int,
+) -> list[dict]:
+    selected: list[tuple[float, dict]] = []
+    for row in table.get("rows") or []:
+        if not isinstance(row, dict):
+            continue
+        row_text = _table_row_preview_text(row)
+        if not row_text:
+            continue
+        overlap_score = _doc_text_overlap_score(
+            row_text,
+            query_terms=query_terms,
+            planner_terms=planner_terms,
+            query_numbers=query_numbers,
+            query_years=query_years,
+        )
+        if overlap_score <= 0:
+            continue
+        selected.append(
+            (
+                overlap_score,
+                {
+                    "table_id": table.get("table_id", "") or "",
+                    "columns": table.get("columns") or [],
+                    "row_text": row_text,
+                },
+            )
+        )
+    selected.sort(key=lambda item: item[0], reverse=True)
+    return [item[1] for item in selected[:max_rows]]
+
+
+def _expand_group_snippets(
+    seed_chunks: List[dict],
+    *,
+    query_terms: set[str],
+    planner_terms: set[str],
+    query_numbers: set[str],
+    query_years: set[str],
+    max_snippets: int,
+) -> list[str]:
+    candidate_docs: list[dict] = []
+    seen_chunk_keys = set()
+    for doc in seed_chunks:
+        filename = (doc.get("filename") or "").strip()
+        page_number = _coerce_int(doc.get("page_number"))
+        if filename and page_number is not None:
+            for candidate in _fetch_neighbor_page_docs(filename, page_number, 0):
+                key = _doc_key(candidate)
+                if key not in seen_chunk_keys:
+                    seen_chunk_keys.add(key)
+                    candidate_docs.append(candidate)
+        chunk_idx = _coerce_int(doc.get("chunk_idx"))
+        if filename and chunk_idx is not None:
+            for candidate in _fetch_neighbor_chunk_docs(filename, chunk_idx, 1):
+                key = _doc_key(candidate)
+                if key not in seen_chunk_keys:
+                    seen_chunk_keys.add(key)
+                    candidate_docs.append(candidate)
+
+    parent_ids = []
+    seen_parent_ids = set()
+    for doc in seed_chunks:
+        parent_id = (doc.get("parent_chunk_id") or "").strip()
+        if parent_id and parent_id not in seen_parent_ids:
+            seen_parent_ids.add(parent_id)
+            parent_ids.append(parent_id)
+    if parent_ids:
+        for candidate in _parent_chunk_store.get_documents_by_ids(parent_ids):
+            key = _doc_key(candidate)
+            if key not in seen_chunk_keys:
+                seen_chunk_keys.add(key)
+                candidate_docs.append(candidate)
+
+    seed_texts = {(doc.get("text") or "").strip() for doc in seed_chunks if (doc.get("text") or "").strip()}
+    scored: list[tuple[float, str]] = []
+    for candidate in candidate_docs:
+        text = (candidate.get("text") or "").strip()
+        if not text or text in seed_texts or _looks_like_cover_or_toc_chunk(candidate, ""):
+            continue
+        overlap_score = _doc_text_overlap_score(
+            text,
+            query_terms=query_terms,
+            planner_terms=planner_terms,
+            query_numbers=query_numbers,
+            query_years=query_years,
+        )
+        if overlap_score <= 0:
+            continue
+        scored.append((overlap_score + _combined_score(candidate), text))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    out: list[str] = []
+    seen_text = set()
+    for _, text in scored:
+        if text in seen_text:
+            continue
+        seen_text.add(text)
+        out.append(text)
+        if len(out) >= max_snippets:
+            break
+    return out
+
+
+def _score_evidence_group(
+    group: dict,
+    *,
+    query_terms: set[str],
+    planner_terms: set[str],
+    query_numbers: set[str],
+    query_years: set[str],
+    query_anchors: List[str],
+) -> float:
+    seed_chunks = group.get("seed_chunks") or []
+    combined_text = "\n".join((chunk.get("text") or "") for chunk in seed_chunks)
+    score = sum(_combined_score(chunk) for chunk in seed_chunks)
+    score += _doc_text_overlap_score(
+        combined_text,
+        query_terms=query_terms,
+        planner_terms=planner_terms,
+        query_numbers=query_numbers,
+        query_years=query_years,
+    )
+    score += 0.15 * len(group.get("matched_queries") or [])
+    score += 0.1 * len(group.get("planner_sources") or [])
+    if group.get("attached_table_ids"):
+        score += 0.4
+    if query_anchors and any(_doc_matches_query_anchors(chunk, query_anchors) for chunk in seed_chunks):
+        score += 0.5
+    if _looks_like_cover_or_toc_chunk({"text": combined_text, "page_number": group.get("page_number")}, ""):
+        score -= 1.0
+    return score
+
+
+def _format_evidence_group_docs(
+    groups: List[dict],
+    *,
+    max_chars_per_group: int,
+) -> tuple[list[dict], int]:
+    out: list[dict] = []
+    total_chars = 0
+    for index, group in enumerate(groups, 1):
+        formatted_text = _format_evidence_group(
+            group,
+            index=index,
+            preview_chars=max_chars_per_group,
+        )
+        matched_chunk = (group.get("seed_chunks") or [{}])[0] or {}
+        out.append(
+            {
+                **matched_chunk,
+                "filename": group.get("filename") or matched_chunk.get("filename", ""),
+                "doc_name": matched_chunk.get("doc_name") or get_doc_name(group.get("filename") or matched_chunk.get("filename", "")),
+                "page_number": group.get("page_number", matched_chunk.get("page_number", "")),
+                "chunk_id": group.get("chunk_id") or matched_chunk.get("chunk_id", ""),
+                "type": "evidence_group",
+                "text": formatted_text,
+                "evidence_type": "evidence_group",
+                "table_id": "",
+                "row_id": "",
+                "table_title": "",
+            }
+        )
+        total_chars += len(formatted_text)
+    return out, total_chars
+
+
+def _build_evidence_groups(
+    query: str,
+    context_docs: List[dict],
+    final_retrieved_docs: List[dict],
+    retrieval_meta: dict | None,
+) -> tuple[list[dict] | None, dict]:
+    table_config = get_table_aware_retrieval_config()
+    group_config = get_evidence_group_config()
+    query_anchors = extract_query_anchors(query)
+    query_terms = _extract_keyword_tokens(query) | _extract_metric_hints(query) | _fallback_query_terms(query)
+    query_numbers = _extract_numbers(query)
+    query_years = _extract_years(query)
+    planner_terms = _collect_planner_terms(retrieval_meta)
+    source_docs = list(context_docs or [])
+    combined_docs = _deduplicate_docs(source_docs + list(final_retrieved_docs or []))
+    candidate_filenames = _extract_table_candidate_filenames(
+        combined_docs,
+        query_anchors=query_anchors,
+        max_files=table_config["max_candidate_docs"],
+    )
+    should_enable, auto_triggered, trigger_reasons = _should_enable_table_aware_retrieval(
+        query,
+        combined_docs,
+        table_config["mode"],
+    )
+    skipped_reasons: list[str] = []
+    base_meta = {
+        "table_aware_retrieval_mode": table_config["mode"],
+        "table_aware_auto_triggered": auto_triggered,
+        "table_aware_trigger_reason": trigger_reasons,
+        "table_context_source": "none",
+        "table_candidate_filenames": candidate_filenames,
+        "table_candidate_pages": _extract_table_candidate_pages(source_docs),
+        "table_ids": [],
+        "table_context_skipped_reasons": skipped_reasons,
+        "evidence_group_count": 0,
+        "selected_evidence_group_count": 0,
+        "evidence_groups_debug": [],
+        "selected_evidence_groups": [],
+        "group_scores": [],
+        "expanded_snippet_count": 0,
+        "relevant_table_row_count": 0,
+        "dropped_group_reasons": [],
+        "final_evidence_pack_source": "chunk_rerank_fallback",
+        "evidence_unit_count": 0,
+        "evidence_units_with_tables": 0,
+        "table_attached_count": 0,
+        "table_attach_reasons": [],
+    }
+    if table_config["mode"] == "off" or not group_config["enabled"]:
+        return None, base_meta
+    if not should_enable and table_config["mode"] != "force":
+        _append_skip_reason(skipped_reasons, "non_table_query")
+        return None, base_meta
+
+    table_cache = _load_tables_by_filename([doc.get("filename") or "" for doc in combined_docs] + candidate_filenames)
+    groups_by_key: dict[tuple, dict] = {}
+    for doc in source_docs:
+        filename = (doc.get("filename") or "").strip()
+        page_number = _coerce_int(doc.get("page_number"))
+        if not filename or page_number is None:
+            continue
+        key = (filename, page_number)
+        group = groups_by_key.setdefault(
+            key,
+            {
+                "seed_chunks": [],
+                "filename": filename,
+                "page_number": page_number,
+                "parent_chunk_ids": [],
+                "matched_queries": [],
+                "planner_sources": [],
+                "group_score": 0.0,
+                "expanded_snippets": [],
+                "relevant_table_rows": [],
+                "attached_table_ids": [],
+                "table_attach_reason": "none",
+            },
+        )
+        group["seed_chunks"].append(doc)
+        parent_id = (doc.get("parent_chunk_id") or "").strip()
+        if parent_id and parent_id not in group["parent_chunk_ids"]:
+            group["parent_chunk_ids"].append(parent_id)
+        for item in doc.get("planner_queries", []) or []:
+            if item not in group["matched_queries"]:
+                group["matched_queries"].append(item)
+        for item in doc.get("planner_sources", []) or []:
+            if item not in group["planner_sources"]:
+                group["planner_sources"].append(item)
+
+    groups = list(groups_by_key.values())
+    dropped_group_reasons: list[dict] = []
+    selected_table_ids: list[str] = []
+    any_table_attached = False
+    for group in groups:
+        seed_chunks = group.get("seed_chunks") or []
+        chunk_table_like = any(_chunk_looks_table_like(doc.get("text", "") or "") for doc in seed_chunks)
+        explicit_table_request = _query_has_explicit_table_request(query)
+        attach_reason = "chunk_table_like" if chunk_table_like else ("query_explicit_table_request" if explicit_table_request else "none")
+        group["matched_snippets"] = [(doc.get("text") or "").strip() for doc in seed_chunks if (doc.get("text") or "").strip()][:group_config["max_snippets_per_group"]]
+        group["expanded_snippets"] = _expand_group_snippets(
+            seed_chunks,
+            query_terms=query_terms,
+            planner_terms=planner_terms,
+            query_numbers=query_numbers,
+            query_years=query_years,
+            max_snippets=group_config["max_snippets_per_group"],
+        )
+        same_page_tables = [
+            table for table in (table_cache.get(group["filename"]) or [])
+            if _coerce_int(table.get("page_number")) == group["page_number"]
+        ]
+        if same_page_tables:
+            filtered_tables, _, _, _ = _apply_anchor_guard_to_tables(
+                same_page_tables,
+                seed_chunks,
+                combined_docs,
+                query_anchors,
+            )
+            for table in filtered_tables[: table_config["max_tables"]]:
+                is_full, rejected_reason = _table_quality_guard(table)
+                if not is_full:
+                    dropped_group_reasons.append(
+                        {
+                            "filename": group["filename"],
+                            "page_number": group["page_number"],
+                            "reason": rejected_reason or "table_quality_rejected",
+                        }
+                    )
+                    continue
+                rows = _select_relevant_table_rows(
+                    table,
+                    query_terms=query_terms,
+                    planner_terms=planner_terms,
+                    query_numbers=query_numbers,
+                    query_years=query_years,
+                    max_rows=group_config["max_table_rows_per_group"],
+                )
+                if not rows:
+                    continue
+                group["relevant_table_rows"].extend(rows)
+                table_id = (table.get("table_id") or "").strip()
+                if table_id and table_id not in group["attached_table_ids"]:
+                    group["attached_table_ids"].append(table_id)
+                    selected_table_ids.append(table_id)
+                any_table_attached = True
+        if group["attached_table_ids"] and attach_reason == "none":
+            attach_reason = "same_page_high_quality_table"
+        group["table_attach_reason"] = attach_reason
+        group["group_score"] = _score_evidence_group(
+            group,
+            query_terms=query_terms,
+            planner_terms=planner_terms,
+            query_numbers=query_numbers,
+            query_years=query_years,
+            query_anchors=query_anchors,
+        )
+
+    if not any_table_attached and (table_config["mode"] == "force" or (table_config["mode"] == "auto" and should_enable)):
+        if candidate_filenames or table_config.get("global_fallback"):
+            filter_expr = _build_table_evidence_filter_expr(candidate_filenames)
+            dense_embeddings, sparse_embeddings = _embedding_service.get_all_embeddings([query])
+            search_hits = _milvus_manager.hybrid_retrieve(
+                dense_embedding=dense_embeddings[0],
+                sparse_embedding=sparse_embeddings[0],
+                top_k=table_config["top_k"],
+                filter_expr=filter_expr,
+            )
+            search_table_ids = _dedupe_table_ids_for_context(search_hits)[: table_config["max_tables"]]
+            candidate_tables = _table_store.get_tables_by_ids(search_table_ids) if search_table_ids else []
+            if candidate_filenames:
+                filename_set = set(candidate_filenames)
+                candidate_tables = [table for table in candidate_tables if (table.get("filename") or "") in filename_set]
+            filtered_tables, _, _, _ = _apply_anchor_guard_to_tables(
+                candidate_tables,
+                search_hits,
+                combined_docs,
+                query_anchors,
+            )
+            for table in filtered_tables:
+                filename = (table.get("filename") or "").strip()
+                matching_groups = [group for group in groups if group.get("filename") == filename]
+                if not matching_groups:
+                    continue
+                rows = _select_relevant_table_rows(
+                    table,
+                    query_terms=query_terms,
+                    planner_terms=planner_terms,
+                    query_numbers=query_numbers,
+                    query_years=query_years,
+                    max_rows=group_config["max_table_rows_per_group"],
+                )
+                if not rows:
+                    continue
+                matching_group = max(matching_groups, key=lambda item: item.get("group_score", 0.0))
+                matching_group["relevant_table_rows"].extend(rows)
+                table_id = (table.get("table_id") or "").strip()
+                if table_id and table_id not in matching_group["attached_table_ids"]:
+                    matching_group["attached_table_ids"].append(table_id)
+                    selected_table_ids.append(table_id)
+                if matching_group.get("table_attach_reason") == "none":
+                    matching_group["table_attach_reason"] = "same_page_high_quality_table"
+                any_table_attached = True
+            if any_table_attached:
+                base_meta["table_context_source"] = "document_scoped_search"
+
+    groups.sort(key=lambda item: float(item.get("group_score", 0.0) or 0.0), reverse=True)
+    selected_groups = groups[: group_config["max_groups"]]
+    formatted_docs, total_chars = _format_evidence_group_docs(
+        selected_groups,
+        max_chars_per_group=group_config["max_chars_per_group"],
+    )
+
+    if not formatted_docs:
+        _append_skip_reason(skipped_reasons, "no_valid_table_candidates")
+        return None, base_meta
+
+    source = base_meta["table_context_source"]
+    if source == "none":
+        if any(group.get("attached_table_ids") for group in selected_groups):
+            source = "same_page_table"
+        else:
+            _append_skip_reason(skipped_reasons, "no_valid_table_candidates")
+
+    meta = {
+        **base_meta,
+        "table_context_source": source,
+        "table_ids": list(dict.fromkeys(selected_table_ids)),
+        "evidence_group_count": len(groups),
+        "selected_evidence_group_count": len(selected_groups),
+        "evidence_groups_debug": [_build_group_debug_payload(group) for group in groups],
+        "selected_evidence_groups": [_build_group_debug_payload(group) for group in selected_groups],
+        "group_scores": [
+            {
+                "filename": group.get("filename", ""),
+                "page_number": group.get("page_number", ""),
+                "group_score": group.get("group_score", 0.0),
+            }
+            for group in groups
+        ],
+        "expanded_snippet_count": sum(len(group.get("expanded_snippets") or []) for group in selected_groups),
+        "relevant_table_row_count": sum(len(group.get("relevant_table_rows") or []) for group in selected_groups),
+        "dropped_group_reasons": dropped_group_reasons,
+        "final_evidence_pack_source": "evidence_groups",
+        "table_context_table_count": sum(len(group.get("attached_table_ids") or []) for group in selected_groups),
+        "table_context_char_count": total_chars,
+        "evidence_unit_count": len(selected_groups),
+        "evidence_units_with_tables": sum(1 for group in selected_groups if group.get("attached_table_ids")),
+        "table_attached_count": sum(len(group.get("attached_table_ids") or []) for group in selected_groups),
+        "table_attach_reasons": list(
+            dict.fromkeys(
+                reason for reason in (group.get("table_attach_reason", "none") for group in selected_groups) if reason and reason != "none"
+            )
+        ),
+    }
+    return formatted_docs, meta
 
 
 def _build_evidence_units(
@@ -1177,6 +1668,16 @@ def _extract_keyword_tokens(text: str) -> set[str]:
 
 def _extract_metric_hints(text: str) -> set[str]:
     return _feature_extract_metric_hints(text)
+
+
+def _fallback_query_terms(text: str) -> set[str]:
+    terms = set()
+    for token in _QUERY_ANCHOR_TOKEN_PATTERN.findall(text or ""):
+        lowered = token.lower()
+        if lowered in _QUERY_ANCHOR_STOPWORDS or len(lowered) <= 2:
+            continue
+        terms.add(lowered)
+    return terms
 
 
 def _score_overlap(query_values: set[str], page_values: set[str]) -> float:
@@ -2568,6 +3069,8 @@ def retrieve_candidate_documents(query: str, candidate_k: int | None = None) -> 
 def _fetch_neighbor_page_docs(filename: str, page_number: int, page_window: int) -> List[dict]:
     if page_window < 0:
         return []
+    if not hasattr(_milvus_manager, "query_all"):
+        return []
     out: List[dict] = []
     escaped_filename = _escape_milvus_string(filename)
     for target_page in range(page_number - page_window, page_number + page_window + 1):
@@ -2585,6 +3088,8 @@ def _fetch_neighbor_page_docs(filename: str, page_number: int, page_window: int)
 
 def _fetch_neighbor_chunk_docs(filename: str, chunk_idx: int, chunk_window: int) -> List[dict]:
     if chunk_window <= 0:
+        return []
+    if not hasattr(_milvus_manager, "query_all"):
         return []
     out: List[dict] = []
     escaped_filename = _escape_milvus_string(filename)
@@ -3094,14 +3599,16 @@ def retrieve_documents(
         enable_page_merge=apply_page_merge,
     )
     context_docs = list(finalized.get("context_docs", []) or [])
-    evidence_unit_docs, table_context_meta = _build_evidence_units(
+    combined_meta = {**(candidates.get("meta", {}) or {}), **(finalized.get("meta", {}) or {})}
+    evidence_group_docs, table_context_meta = _build_evidence_groups(
         query,
         context_docs,
         finalized.get("final_retrieved_docs", []) or [],
+        combined_meta,
     )
-    if table_aware_config["mode"] != "off" and evidence_unit_docs:
-        context_docs = evidence_unit_docs
-    meta = {**candidates.get("meta", {}), **finalized.get("meta", {}), **table_context_meta}
+    if table_aware_config["mode"] != "off" and evidence_group_docs:
+        context_docs = evidence_group_docs
+    meta = {**combined_meta, **table_context_meta}
     meta["latency_breakdown"] = {
         **(candidates.get("meta", {}).get("latency_breakdown", {}) or {}),
         **(finalized.get("meta", {}).get("latency_breakdown", {}) or {}),
@@ -3177,6 +3684,14 @@ def debug_retrieval_pipeline(question: str, top_k: int = 10) -> Dict[str, Any]:
             "evidence_units_with_tables": meta.get("evidence_units_with_tables", 0),
             "table_attached_count": meta.get("table_attached_count", 0),
             "table_attach_reasons": meta.get("table_attach_reasons", []) or [],
+            "evidence_group_count": meta.get("evidence_group_count", 0),
+            "selected_evidence_group_count": meta.get("selected_evidence_group_count", 0),
+            "evidence_groups_debug": meta.get("evidence_groups_debug", []) or [],
+            "selected_evidence_groups": meta.get("selected_evidence_groups", []) or [],
+            "group_scores": meta.get("group_scores", []) or [],
+            "expanded_snippet_count": meta.get("expanded_snippet_count", 0),
+            "relevant_table_row_count": meta.get("relevant_table_row_count", 0),
+            "dropped_group_reasons": meta.get("dropped_group_reasons", []) or [],
             "table_candidate_filenames": meta.get("table_candidate_filenames", []) or [],
             "table_candidate_pages": meta.get("table_candidate_pages", []) or [],
             "table_ids": meta.get("table_ids", []) or [],

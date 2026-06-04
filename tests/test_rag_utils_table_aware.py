@@ -851,10 +851,13 @@ def test_retrieve_documents_auto_attaches_same_page_table_from_context_doc(monke
     result = module.retrieve_documents("What was net sales?", top_k=5)
 
     assert len(result["context_docs"]) == 1
-    assert "[Evidence 1]" in result["context_docs"][0]["text"]
-    assert "Matched text:" in result["context_docs"][0]["text"]
-    assert "Attached same-page table:" in result["context_docs"][0]["text"]
+    assert "[Evidence Group 1]" in result["context_docs"][0]["text"]
+    assert "Matched snippets:" in result["context_docs"][0]["text"]
+    assert "Relevant table rows:" in result["context_docs"][0]["text"]
     assert result["meta"]["evidence_units_with_tables"] == 1
+    assert result["meta"]["evidence_group_count"] == 1
+    assert result["meta"]["selected_evidence_group_count"] == 1
+    assert result["meta"]["final_evidence_pack_source"] == "evidence_groups"
     assert "chunk_table_like" in result["meta"]["table_attach_reasons"]
 
 

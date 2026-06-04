@@ -126,6 +126,14 @@ class RagTrace(BaseModel):
     evidence_units_with_tables: Optional[int] = None
     table_attached_count: Optional[int] = None
     table_attach_reasons: Optional[List[str]] = None
+    evidence_group_count: Optional[int] = None
+    selected_evidence_group_count: Optional[int] = None
+    evidence_groups_debug: Optional[List[dict]] = None
+    selected_evidence_groups: Optional[List[dict]] = None
+    group_scores: Optional[List[dict]] = None
+    expanded_snippet_count: Optional[int] = None
+    relevant_table_row_count: Optional[int] = None
+    dropped_group_reasons: Optional[List[dict]] = None
     table_candidate_filenames: Optional[List[str]] = None
     table_candidate_pages: Optional[List[dict]] = None
     table_ids: Optional[List[str]] = None
