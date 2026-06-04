@@ -11,6 +11,9 @@ def test_format_evidence_group_contains_snippets_and_table_rows():
             "relevant_table_rows": [
                 {
                     "table_id": "t1",
+                    "page_number": 8,
+                    "row_label": "Net sales",
+                    "values_sequence": "3,909 | 3,673",
                     "columns": ["Metric", "2023", "2022"],
                     "row_text": "Metric: Net sales; 2023: 3,909; 2022: 3,673",
                 }
@@ -25,6 +28,9 @@ def test_format_evidence_group_contains_snippets_and_table_rows():
     assert "Expanded snippets:" in text
     assert "Relevant table rows:" in text
     assert "Table ID: t1" in text
+    assert "Page: 8" in text
+    assert "Values: 3,909 | 3,673" in text
+    assert text.index("Relevant table rows:") < text.index("Matched snippets:")
 
 
 def test_build_group_debug_payload_counts_rows_and_snippets():

@@ -43,6 +43,26 @@ def format_evidence_group(
         f"Source: {filename}, page {page_number}",
     ]
 
+    relevant_table_rows = list(group.get("relevant_table_rows") or [])
+    if relevant_table_rows:
+        lines.append("Relevant table rows:")
+        for row in relevant_table_rows:
+            table_id = _clean_text(row.get("table_id"))
+            row_page_number = row.get("page_number", page_number)
+            row_label = _clean_text(row.get("row_label"))
+            values_sequence = _clean_text(row.get("values_sequence"))
+            columns = row.get("columns") or []
+            row_text = _clean_text(row.get("row_text"))
+            lines.append(
+                f"- Table ID: {table_id} | Page: {row_page_number} | Row Label: {row_label or '(unknown)'}"
+            )
+            if values_sequence:
+                lines.append(f"  Values: {values_sequence}")
+            if columns:
+                lines.append(f"  Columns: {columns}")
+            if row_text:
+                lines.append(f"  Row: {_preview_text(row_text, preview_chars)}")
+
     matched_snippets = list(group.get("matched_snippets") or [])
     if matched_snippets:
         lines.append("Matched snippets:")
@@ -54,19 +74,6 @@ def format_evidence_group(
         lines.append("Expanded snippets:")
         for snippet in expanded_snippets:
             lines.append(f"- {_preview_text(snippet, preview_chars)}")
-
-    relevant_table_rows = list(group.get("relevant_table_rows") or [])
-    if relevant_table_rows:
-        lines.append("Relevant table rows:")
-        for row in relevant_table_rows:
-            table_id = _clean_text(row.get("table_id"))
-            columns = row.get("columns") or []
-            row_text = _clean_text(row.get("row_text"))
-            lines.append(f"- Table ID: {table_id}")
-            if columns:
-                lines.append(f"  Columns: {columns}")
-            if row_text:
-                lines.append(f"  Row: {_preview_text(row_text, preview_chars)}")
 
     return "\n".join(lines)
 
@@ -84,4 +91,3 @@ def build_group_debug_payload(group: dict) -> dict:
         "expanded_snippet_count": len(group.get("expanded_snippets") or []),
         "relevant_table_row_count": len(group.get("relevant_table_rows") or []),
     }
-

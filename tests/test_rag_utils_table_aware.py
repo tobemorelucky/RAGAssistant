@@ -605,6 +605,7 @@ def test_debug_retrieval_pipeline_exposes_table_aware_trace_fields(monkeypatch):
                 "planner_table_queries": [],
                 "planner_validation_dropped_queries": [{"field": "semantic_queries", "query": "AES operating margin 2022", "reason": "validation_failed"}],
                 "planner_parse_error": "",
+                "route_budget_applied": {"max_planner_routes": 4, "planner_route_top_k": 10},
                 "per_query_retrieval_counts": [{"label": "original", "count": 3}],
                 "rrf_fused_candidate_count": 4,
                 "page_level_fusion_enabled": True,
@@ -629,6 +630,8 @@ def test_debug_retrieval_pipeline_exposes_table_aware_trace_fields(monkeypatch):
                 "table_candidate_pages": [{"filename": "demo.pdf", "page_number": 8}],
                 "table_ids": ["t1"],
                 "table_context_skipped_reasons": ["table_quality_rejected"],
+                "table_page_mismatch_count": 1,
+                "table_page_mismatch_examples": [{"filename": "demo.pdf", "group_page_number": 8, "table_page_number": 10, "table_id": "t1"}],
                 "latency_breakdown": {"total_retrieval_ms": 12.3},
             },
         },
@@ -650,6 +653,7 @@ def test_debug_retrieval_pipeline_exposes_table_aware_trace_fields(monkeypatch):
         {"field": "semantic_queries", "query": "AES operating margin 2022", "reason": "validation_failed"}
     ]
     assert trace["planner_parse_error"] == ""
+    assert trace["route_budget_applied"] == {"max_planner_routes": 4, "planner_route_top_k": 10}
     assert trace["per_query_retrieval_counts"] == [{"label": "original", "count": 3}]
     assert trace["rrf_fused_candidate_count"] == 4
     assert trace["page_level_fusion_enabled"] is True
@@ -674,6 +678,7 @@ def test_debug_retrieval_pipeline_exposes_table_aware_trace_fields(monkeypatch):
     assert trace["table_candidate_pages"] == [{"filename": "demo.pdf", "page_number": 8}]
     assert trace["table_ids"] == ["t1"]
     assert trace["table_context_skipped_reasons"] == ["table_quality_rejected"]
+    assert trace["table_page_mismatch_count"] == 1
 
 
 def test_table_aware_anchor_guard_filters_wrong_adobe_table(monkeypatch):
@@ -859,6 +864,7 @@ def test_retrieve_documents_auto_attaches_same_page_table_from_context_doc(monke
     assert result["meta"]["selected_evidence_group_count"] == 1
     assert result["meta"]["final_evidence_pack_source"] == "evidence_groups"
     assert "chunk_table_like" in result["meta"]["table_attach_reasons"]
+    assert result["meta"]["final_evidence_pack_used"][0]["text"].index("Relevant table rows:") < result["meta"]["final_evidence_pack_used"][0]["text"].index("Matched snippets:")
 
 
 def test_retrieve_documents_auto_non_table_query_does_not_force_table_attachment(monkeypatch):
@@ -909,6 +915,73 @@ def test_retrieve_documents_auto_non_table_query_does_not_force_table_attachment
     assert result["context_docs"] == [doc]
     assert result["meta"]["evidence_units_with_tables"] == 0
     assert result["meta"]["table_context_source"] == "none"
+
+
+def test_retrieve_documents_document_scoped_table_fallback_creates_standalone_group(monkeypatch):
+    module = _install_rag_utils_stubs()
+
+    doc = {
+        "filename": "1.pdf",
+        "doc_name": "1",
+        "page_number": 8,
+        "chunk_id": "c1",
+        "text": "Income statement discussion with ratios and trends.",
+        "type": "chunk",
+        "evidence_type": "text_chunk",
+    }
+
+    class _FakeMilvus:
+        def hybrid_retrieve(self, **kwargs):
+            return [
+                {
+                    "filename": "1.pdf",
+                    "page_number": 12,
+                    "table_id": "t1",
+                    "evidence_type": "table_row",
+                    "row_id": "row_1",
+                    "text": "Row Values: Metric: Net sales; 2023: 3,909; 2022: 3,673",
+                    "score": 0.9,
+                }
+            ]
+
+    class _FakeTableStore:
+        def get_tables_by_filename(self, filename):
+            return []
+
+        def get_tables_by_ids(self, table_ids):
+            return [
+                {
+                    "table_id": "t1",
+                    "filename": "1.pdf",
+                    "page_number": 12,
+                    "columns": ["Metric", "2023", "2022"],
+                    "rows": [{"Metric": "Net sales", "2023": "3,909", "2022": "3,673"}],
+                    "csv_text": "",
+                    "title": "Statements of income",
+                }
+            ]
+
+    monkeypatch.setenv("TABLE_AWARE_RETRIEVAL", "force")
+    monkeypatch.setattr(module, "_milvus_manager", _FakeMilvus())
+    monkeypatch.setattr(module, "_table_store", _FakeTableStore())
+    monkeypatch.setattr(module, "retrieve_candidate_documents", lambda query, candidate_k=None: {"docs": [doc], "meta": {}})
+    monkeypatch.setattr(
+        module,
+        "finalize_retrieved_documents",
+        lambda query, candidate_docs, final_top_k=None, enable_page_merge=None, adjacent_page_window=None, adjacent_chunk_window=None: {
+            "final_retrieved_docs": [doc],
+            "context_docs": [doc],
+            "meta": {},
+        },
+    )
+
+    result = module.retrieve_documents("What was net sales?", top_k=5)
+
+    assert result["meta"]["table_context_source"] == "document_scoped_search"
+    assert result["meta"]["table_page_mismatch_count"] >= 1
+    assert result["meta"]["selected_evidence_group_count"] >= 1
+    assert any(group.get("page_number") == 12 for group in result["meta"]["selected_evidence_groups"])
+    assert "Statements of income" in result["meta"]["final_evidence_pack_used"][0]["text"] or "Table ID: t1" in result["meta"]["final_evidence_pack_used"][0]["text"]
 
 
 def test_retrieve_candidate_documents_uses_query_planner_and_rrf(monkeypatch):
@@ -962,10 +1035,10 @@ def test_retrieve_candidate_documents_uses_query_planner_and_rrf(monkeypatch):
 
     assert [item["query"] for item in calls] == [
         "What was Adobe operating margin in 2022?",
-        "Adobe operating margin 2022",
         "Adobe revenue income from operations 2022",
-        "Adobe statements of income 2022",
+        "Adobe operating margin 2022",
         "Adobe margin 2022",
+        "Adobe statements of income 2022",
     ]
     assert result["meta"]["query_planner_enabled"] is True
     assert result["meta"]["planner_dense_queries"] == ["Adobe operating margin 2022"]
@@ -974,6 +1047,13 @@ def test_retrieve_candidate_documents_uses_query_planner_and_rrf(monkeypatch):
     assert result["meta"]["planner_table_heading_queries"] == ["Adobe statements of income 2022"]
     assert result["meta"]["planner_keyword_queries"] == ["Adobe margin 2022"]
     assert result["meta"]["rrf_fused_candidate_count"] == 5
+    assert result["meta"]["route_budget_applied"] == {
+        "max_planner_routes": 4,
+        "planner_route_top_k": 10,
+        "planner_route_limit_applied": 3,
+        "planner_routes_selected": 4,
+        "planner_routes_dropped": 0,
+    }
     assert result["meta"]["page_level_fusion_enabled"] is True
     assert result["meta"]["fused_page_count"] == 2
     assert result["meta"]["fused_top_pages"][0]["page_number"] == 8
@@ -985,6 +1065,56 @@ def test_retrieve_candidate_documents_uses_query_planner_and_rrf(monkeypatch):
     }
     assert len(result["meta"]["per_query_retrieval_counts"]) == 5
     assert result["docs"][0]["chunk_id"] == "c1"
+
+
+def test_retrieve_candidate_documents_applies_planner_route_budget(monkeypatch):
+    module = _install_rag_utils_stubs()
+    calls = []
+
+    monkeypatch.setenv("RAG_QUERY_PLANNER_ENABLED", "true")
+    monkeypatch.setenv("RAG_MAX_PLANNER_ROUTES", "2")
+    monkeypatch.setenv("RAG_PLANNER_ROUTE_TOP_K", "4")
+    monkeypatch.setattr(
+        module,
+        "plan_retrieval_queries",
+        lambda question: {
+            "enabled": True,
+            "intent": "numeric_lookup",
+            "must_keep_terms": ["AMD", "2022"],
+            "semantic_queries": ["AMD quick ratio 2022"],
+            "evidence_field_queries": [
+                "AMD current liabilities 2022",
+                "AMD cash equivalents receivables 2022",
+            ],
+            "table_heading_queries": ["AMD balance sheet 2022"],
+            "keyword_queries": ["AMD quick ratio"],
+            "planner_validation_dropped_queries": [],
+            "expected_evidence_type": "text",
+            "constraints": [],
+            "parse_error": "",
+        },
+    )
+
+    def _fake_retrieve_leaf_chunks(query, top_k, filter_expr, retrieval_scope):
+        calls.append((query, top_k))
+        return {"docs": [], "meta": {"retrieval_mode": "hybrid"}}
+
+    monkeypatch.setattr(module, "_retrieve_leaf_chunks", _fake_retrieve_leaf_chunks)
+
+    result = module.retrieve_candidate_documents("What was AMD quick ratio in 2022?", candidate_k=8)
+
+    assert calls == [
+        ("What was AMD quick ratio in 2022?", 8),
+        ("AMD current liabilities 2022", 4),
+        ("AMD cash equivalents receivables 2022", 4),
+    ]
+    assert result["meta"]["route_budget_applied"] == {
+        "max_planner_routes": 2,
+        "planner_route_top_k": 4,
+        "planner_route_limit_applied": 4,
+        "planner_routes_selected": 2,
+        "planner_routes_dropped": 3,
+    }
 
 
 def test_retrieve_candidate_documents_page_fusion_anchor_guard_filters_cross_anchor_pages(monkeypatch):

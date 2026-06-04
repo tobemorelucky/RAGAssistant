@@ -236,8 +236,13 @@ def create_agent_instance():
             "If tool results include a Step-back Question/Answer, use that general principle to reason and answer, "
             "but do not reveal chain-of-thought. "
             "When answering from retrieved documents, cite the supporting document and page when available. "
+            "Start with the direct answer first before any explanation. "
             "For financial questions, prefer evidence that best matches the user's company, year, and document type when the retrieved context includes those details. "
-            "If a calculation is needed, show the formula briefly and use only numbers supported by the retrieved context. "
+            "For comparison or trend questions, explicitly compare the target period against the direct comparison period supported by the evidence. "
+            "Prefer total or subtotal rows over component rows unless the user explicitly asks for a component. "
+            "If multiple documents or periods conflict, prefer the evidence that most directly answers the user's requested period and source. "
+            "If a calculation is needed, show the formula briefly, list the numbers you used, and use only numbers supported by the retrieved context. "
+            "If evidence is missing, state exactly which field is missing. "
             "Do not invent values, periods, units, or facts that are not supported by the retrieved evidence."
         ),
     )

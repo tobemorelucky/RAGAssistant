@@ -85,6 +85,7 @@ class RagTrace(BaseModel):
     planner_table_queries: Optional[List[str]] = None
     planner_validation_dropped_queries: Optional[List[dict]] = None
     planner_parse_error: Optional[str] = None
+    route_budget_applied: Optional[dict] = None
     per_query_retrieval_counts: Optional[List[dict]] = None
     rrf_fused_candidate_count: Optional[int] = None
     page_level_fusion_enabled: Optional[bool] = None
@@ -126,6 +127,8 @@ class RagTrace(BaseModel):
     evidence_units_with_tables: Optional[int] = None
     table_attached_count: Optional[int] = None
     table_attach_reasons: Optional[List[str]] = None
+    table_page_mismatch_count: Optional[int] = None
+    table_page_mismatch_examples: Optional[List[dict]] = None
     evidence_group_count: Optional[int] = None
     selected_evidence_group_count: Optional[int] = None
     evidence_groups_debug: Optional[List[dict]] = None

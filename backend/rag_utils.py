@@ -155,10 +155,17 @@ def get_table_aware_retrieval_config() -> Dict[str, Any]:
 def get_evidence_group_config() -> Dict[str, Any]:
     return {
         "enabled": _parse_bool(os.getenv("RAG_EVIDENCE_GROUPING_ENABLED"), True),
-        "max_groups": max(1, _parse_int(os.getenv("RAG_MAX_EVIDENCE_GROUPS"), 5)),
-        "max_snippets_per_group": max(1, _parse_int(os.getenv("RAG_MAX_SNIPPETS_PER_GROUP"), 3)),
-        "max_table_rows_per_group": max(1, _parse_int(os.getenv("RAG_MAX_TABLE_ROWS_PER_GROUP"), 5)),
-        "max_chars_per_group": max(200, _parse_int(os.getenv("RAG_MAX_CHARS_PER_GROUP"), 1200)),
+        "max_groups": max(1, _parse_int(os.getenv("RAG_MAX_EVIDENCE_GROUPS"), 3)),
+        "max_snippets_per_group": max(1, _parse_int(os.getenv("RAG_MAX_SNIPPETS_PER_GROUP"), 2)),
+        "max_table_rows_per_group": max(1, _parse_int(os.getenv("RAG_MAX_TABLE_ROWS_PER_GROUP"), 4)),
+        "max_chars_per_group": max(200, _parse_int(os.getenv("RAG_MAX_CHARS_PER_GROUP"), 1000)),
+    }
+
+
+def get_planner_route_budget_config() -> Dict[str, Any]:
+    return {
+        "max_planner_routes": max(0, _parse_int(os.getenv("RAG_MAX_PLANNER_ROUTES"), 4)),
+        "planner_route_top_k": max(1, _parse_int(os.getenv("RAG_PLANNER_ROUTE_TOP_K"), 10)),
     }
 
 
@@ -595,6 +602,26 @@ def _load_tables_by_filename(filenames: List[str]) -> dict[str, list[dict]]:
     return out
 
 
+def _get_nearby_tables(
+    table_cache: dict[str, list[dict]],
+    filename: str,
+    page_number: int,
+    *,
+    page_window: int = 1,
+) -> tuple[list[dict], list[dict]]:
+    nearby: list[dict] = []
+    mismatched: list[dict] = []
+    for table in table_cache.get(filename, []) or []:
+        table_page = _coerce_int(table.get("page_number"))
+        if table_page is None:
+            continue
+        if abs(table_page - page_number) <= page_window:
+            nearby.append(table)
+        else:
+            mismatched.append(table)
+    return nearby, mismatched
+
+
 def _build_attached_table_payload(table: dict, include_full: bool, skipped_reason: str = "") -> dict:
     return {
         "table": table,
@@ -698,6 +725,40 @@ def _table_row_preview_text(row: dict) -> str:
     return "; ".join(parts)
 
 
+def _extract_table_row_label(row: dict) -> str:
+    priority_keys = ("metric", "row label", "label", "item", "description", "line item")
+    for key, value in (row or {}).items():
+        if str(key).startswith("_"):
+            continue
+        key_text = str(key).strip().lower()
+        value_text = str(value).strip()
+        if value_text and key_text in priority_keys:
+            return value_text
+    for key, value in (row or {}).items():
+        if str(key).startswith("_"):
+            continue
+        value_text = str(value).strip()
+        if value_text:
+            return value_text
+    return ""
+
+
+def _extract_table_row_values(row: dict) -> list[str]:
+    label = _extract_table_row_label(row)
+    values: list[str] = []
+    for key, value in (row or {}).items():
+        if str(key).startswith("_"):
+            continue
+        key_text = str(key).strip().lower()
+        value_text = str(value).strip()
+        if not value_text:
+            continue
+        if value_text == label and key_text in {"metric", "row label", "label", "item", "description", "line item"}:
+            continue
+        values.append(value_text)
+    return values
+
+
 def _select_relevant_table_rows(
     table: dict,
     *,
@@ -714,6 +775,8 @@ def _select_relevant_table_rows(
         row_text = _table_row_preview_text(row)
         if not row_text:
             continue
+        row_label = _extract_table_row_label(row)
+        row_values = _extract_table_row_values(row)
         overlap_score = _doc_text_overlap_score(
             row_text,
             query_terms=query_terms,
@@ -723,12 +786,20 @@ def _select_relevant_table_rows(
         )
         if overlap_score <= 0:
             continue
+        label_lower = row_label.lower()
+        if "total" in label_lower or "subtotal" in label_lower:
+            overlap_score += 0.25
         selected.append(
             (
                 overlap_score,
                 {
                     "table_id": table.get("table_id", "") or "",
+                    "page_number": table.get("page_number", ""),
+                    "table_title": table.get("title") or table.get("caption") or "",
                     "columns": table.get("columns") or [],
+                    "row_label": row_label,
+                    "values_sequence": " | ".join(row_values),
+                    "values": row_values,
                     "row_text": row_text,
                 },
             )
@@ -871,6 +942,53 @@ def _format_evidence_group_docs(
     return out, total_chars
 
 
+def _build_standalone_table_group(
+    table: dict,
+    *,
+    related_hits: List[dict],
+    relevant_rows: List[dict],
+    query_terms: set[str],
+    planner_terms: set[str],
+    query_numbers: set[str],
+    query_years: set[str],
+    query_anchors: List[str],
+) -> dict:
+    matched_snippets = []
+    for hit in related_hits or []:
+        text = (hit.get("text") or "").strip()
+        if text and text not in matched_snippets:
+            matched_snippets.append(text)
+    fallback_snippet = (
+        (table.get("title") or table.get("caption") or "").strip()
+        or (table.get("csv_text") or "").strip()
+    )
+    if not matched_snippets and fallback_snippet:
+        matched_snippets.append(fallback_snippet)
+    group = {
+        "seed_chunks": related_hits or [],
+        "filename": table.get("filename") or "",
+        "page_number": _coerce_int(table.get("page_number")),
+        "parent_chunk_ids": [],
+        "matched_queries": [],
+        "planner_sources": ["document_scoped_search"],
+        "group_score": 0.0,
+        "matched_snippets": matched_snippets[:2],
+        "expanded_snippets": [],
+        "relevant_table_rows": relevant_rows,
+        "attached_table_ids": [table.get("table_id") or ""],
+        "table_attach_reason": "document_scoped_search",
+    }
+    group["group_score"] = _score_evidence_group(
+        group,
+        query_terms=query_terms,
+        planner_terms=planner_terms,
+        query_numbers=query_numbers,
+        query_years=query_years,
+        query_anchors=query_anchors,
+    )
+    return group
+
+
 def _build_evidence_groups(
     query: str,
     context_docs: List[dict],
@@ -915,10 +1033,14 @@ def _build_evidence_groups(
         "relevant_table_row_count": 0,
         "dropped_group_reasons": [],
         "final_evidence_pack_source": "chunk_rerank_fallback",
+        "final_evidence_pack_used": [],
+        "final_evidence_pack_used_count": 0,
         "evidence_unit_count": 0,
         "evidence_units_with_tables": 0,
         "table_attached_count": 0,
         "table_attach_reasons": [],
+        "table_page_mismatch_count": 0,
+        "table_page_mismatch_examples": [],
     }
     if table_config["mode"] == "off" or not group_config["enabled"]:
         return None, base_meta
@@ -965,6 +1087,7 @@ def _build_evidence_groups(
     dropped_group_reasons: list[dict] = []
     selected_table_ids: list[str] = []
     any_table_attached = False
+    table_page_mismatch_examples: list[dict] = []
     for group in groups:
         seed_chunks = group.get("seed_chunks") or []
         chunk_table_like = any(_chunk_looks_table_like(doc.get("text", "") or "") for doc in seed_chunks)
@@ -979,13 +1102,26 @@ def _build_evidence_groups(
             query_years=query_years,
             max_snippets=group_config["max_snippets_per_group"],
         )
-        same_page_tables = [
-            table for table in (table_cache.get(group["filename"]) or [])
-            if _coerce_int(table.get("page_number")) == group["page_number"]
-        ]
-        if same_page_tables:
+        nearby_tables, mismatched_tables = _get_nearby_tables(
+            table_cache,
+            group["filename"],
+            group["page_number"],
+            page_window=1,
+        )
+        for table in mismatched_tables[:3]:
+            if len(table_page_mismatch_examples) >= 5:
+                break
+            table_page_mismatch_examples.append(
+                {
+                    "filename": group["filename"],
+                    "group_page_number": group["page_number"],
+                    "table_page_number": _coerce_int(table.get("page_number")),
+                    "table_id": table.get("table_id", "") or "",
+                }
+            )
+        if nearby_tables:
             filtered_tables, _, _, _ = _apply_anchor_guard_to_tables(
-                same_page_tables,
+                nearby_tables,
                 seed_chunks,
                 combined_docs,
                 query_anchors,
@@ -1051,10 +1187,6 @@ def _build_evidence_groups(
                 query_anchors,
             )
             for table in filtered_tables:
-                filename = (table.get("filename") or "").strip()
-                matching_groups = [group for group in groups if group.get("filename") == filename]
-                if not matching_groups:
-                    continue
                 rows = _select_relevant_table_rows(
                     table,
                     query_terms=query_terms,
@@ -1065,18 +1197,59 @@ def _build_evidence_groups(
                 )
                 if not rows:
                     continue
-                matching_group = max(matching_groups, key=lambda item: item.get("group_score", 0.0))
-                matching_group["relevant_table_rows"].extend(rows)
+                filename = (table.get("filename") or "").strip()
                 table_id = (table.get("table_id") or "").strip()
-                if table_id and table_id not in matching_group["attached_table_ids"]:
-                    matching_group["attached_table_ids"].append(table_id)
-                    selected_table_ids.append(table_id)
-                if matching_group.get("table_attach_reason") == "none":
-                    matching_group["table_attach_reason"] = "same_page_high_quality_table"
+                table_page = _coerce_int(table.get("page_number"))
+                matching_groups = [
+                    group
+                    for group in groups
+                    if group.get("filename") == filename
+                    and table_page is not None
+                    and abs(int(group.get("page_number", -9999)) - table_page) <= 1
+                ]
+                related_hits = [
+                    hit
+                    for hit in (search_hits or [])
+                    if (hit.get("table_id") or "").strip() == table_id
+                ]
+                if matching_groups:
+                    matching_group = max(matching_groups, key=lambda item: item.get("group_score", 0.0))
+                    matching_group["relevant_table_rows"].extend(rows)
+                    if table_id and table_id not in matching_group["attached_table_ids"]:
+                        matching_group["attached_table_ids"].append(table_id)
+                        selected_table_ids.append(table_id)
+                    if matching_group.get("table_attach_reason") == "none":
+                        matching_group["table_attach_reason"] = "same_page_high_quality_table"
+                else:
+                    if len(table_page_mismatch_examples) < 5:
+                        table_page_mismatch_examples.append(
+                            {
+                                "filename": filename,
+                                "group_page_number": "",
+                                "table_page_number": table_page,
+                                "table_id": table_id,
+                            }
+                        )
+                    groups.append(
+                        _build_standalone_table_group(
+                            table,
+                            related_hits=related_hits,
+                            relevant_rows=rows,
+                            query_terms=query_terms,
+                            planner_terms=planner_terms,
+                            query_numbers=query_numbers,
+                            query_years=query_years,
+                            query_anchors=query_anchors,
+                        )
+                    )
+                    if table_id:
+                        selected_table_ids.append(table_id)
                 any_table_attached = True
             if any_table_attached:
                 base_meta["table_context_source"] = "document_scoped_search"
 
+    for group in groups:
+        group["relevant_table_rows"] = list(group.get("relevant_table_rows") or [])[: group_config["max_table_rows_per_group"]]
     groups.sort(key=lambda item: float(item.get("group_score", 0.0) or 0.0), reverse=True)
     selected_groups = groups[: group_config["max_groups"]]
     formatted_docs, total_chars = _format_evidence_group_docs(
@@ -1115,6 +1288,8 @@ def _build_evidence_groups(
         "relevant_table_row_count": sum(len(group.get("relevant_table_rows") or []) for group in selected_groups),
         "dropped_group_reasons": dropped_group_reasons,
         "final_evidence_pack_source": "evidence_groups",
+        "final_evidence_pack_used": formatted_docs,
+        "final_evidence_pack_used_count": len(formatted_docs),
         "table_context_table_count": sum(len(group.get("attached_table_ids") or []) for group in selected_groups),
         "table_context_char_count": total_chars,
         "evidence_unit_count": len(selected_groups),
@@ -1125,6 +1300,8 @@ def _build_evidence_groups(
                 reason for reason in (group.get("table_attach_reason", "none") for group in selected_groups) if reason and reason != "none"
             )
         ),
+        "table_page_mismatch_count": len(table_page_mismatch_examples),
+        "table_page_mismatch_examples": table_page_mismatch_examples,
     }
     return formatted_docs, meta
 
@@ -2021,8 +2198,9 @@ def _build_retrieval_routes(
     original_query: str,
     candidate_k: int,
     planner: Dict[str, Any],
-) -> list[dict]:
+) -> tuple[list[dict], dict]:
     planner = planner or {}
+    route_budget = get_planner_route_budget_config()
     routes: list[dict] = [
         {
             "label": "original",
@@ -2033,10 +2211,17 @@ def _build_retrieval_routes(
         }
     ]
     seen = {original_query.strip().lower()}
-    route_limit = _planner_query_limit(candidate_k)
+    route_limit = min(_planner_query_limit(candidate_k), route_budget["planner_route_top_k"])
+    remaining_planner_routes = route_budget["max_planner_routes"]
+    planner_routes_selected = 0
+    planner_routes_dropped = 0
 
     def _append(items: list[str], label_prefix: str, weight: float, category: str) -> None:
+        nonlocal remaining_planner_routes, planner_routes_selected, planner_routes_dropped
         for index, item in enumerate(items or [], 1):
+            if remaining_planner_routes <= 0:
+                planner_routes_dropped += 1
+                continue
             query = (item or "").strip()
             lowered = query.lower()
             if not query or lowered in seen:
@@ -2051,12 +2236,21 @@ def _build_retrieval_routes(
                     "category": category,
                 }
             )
+            remaining_planner_routes -= 1
+            planner_routes_selected += 1
 
-    _append(planner.get("semantic_queries") or [], "semantic", 0.75, "semantic")
     _append(planner.get("evidence_field_queries") or [], "evidence_field", 0.85, "evidence_field")
-    _append(planner.get("table_heading_queries") or [], "table_heading", 0.55, "table_heading")
+    _append(planner.get("semantic_queries") or [], "semantic", 0.75, "semantic")
     _append(planner.get("keyword_queries") or [], "keyword", 0.65, "keyword")
-    return routes
+    _append(planner.get("table_heading_queries") or [], "table_heading", 0.55, "table_heading")
+    budget_meta = {
+        "max_planner_routes": route_budget["max_planner_routes"],
+        "planner_route_top_k": route_budget["planner_route_top_k"],
+        "planner_route_limit_applied": route_limit,
+        "planner_routes_selected": planner_routes_selected,
+        "planner_routes_dropped": planner_routes_dropped,
+    }
+    return routes, budget_meta
 
 
 def _rrf_fuse_retrieval_routes(
@@ -2938,6 +3132,7 @@ def retrieve_candidate_documents(query: str, candidate_k: int | None = None) -> 
         "planner_table_queries": [],
         "planner_validation_dropped_queries": [],
         "planner_parse_error": "",
+        "route_budget_applied": {},
         "per_query_retrieval_counts": [],
         "rrf_fused_candidate_count": 0,
         "page_level_fusion_enabled": False,
@@ -2974,7 +3169,7 @@ def retrieve_candidate_documents(query: str, candidate_k: int | None = None) -> 
         "constraints": [],
         "parse_error": "",
     }
-    routes = _build_retrieval_routes(query, candidate_k, planner)
+    routes, route_budget_meta = _build_retrieval_routes(query, candidate_k, planner)
     route_results: list[dict] = []
     per_query_retrieval_counts: list[dict] = []
     last_meta: Dict[str, Any] = {}
@@ -3027,6 +3222,7 @@ def retrieve_candidate_documents(query: str, candidate_k: int | None = None) -> 
         "planner_table_queries": planner.get("table_heading_queries", []) or [],
         "planner_validation_dropped_queries": planner.get("planner_validation_dropped_queries", []) or [],
         "planner_parse_error": planner.get("parse_error", ""),
+        "route_budget_applied": route_budget_meta,
         "per_query_retrieval_counts": per_query_retrieval_counts,
         "rrf_fused_candidate_count": len(fused_docs_all),
         "page_level_fusion_enabled": page_level_fusion_enabled,
@@ -3609,6 +3805,11 @@ def retrieve_documents(
     if table_aware_config["mode"] != "off" and evidence_group_docs:
         context_docs = evidence_group_docs
     meta = {**combined_meta, **table_context_meta}
+    if table_aware_config["mode"] != "off" and evidence_group_docs:
+        meta["final_evidence_pack_used"] = context_docs
+        meta["final_evidence_pack_used_count"] = len(context_docs)
+        meta["final_evidence_pack_debug"] = context_docs
+        meta["final_evidence_pack"] = context_docs
     meta["latency_breakdown"] = {
         **(candidates.get("meta", {}).get("latency_breakdown", {}) or {}),
         **(finalized.get("meta", {}).get("latency_breakdown", {}) or {}),
@@ -3660,6 +3861,7 @@ def debug_retrieval_pipeline(question: str, top_k: int = 10) -> Dict[str, Any]:
             "planner_table_queries": meta.get("planner_table_queries", []) or [],
             "planner_validation_dropped_queries": meta.get("planner_validation_dropped_queries", []) or [],
             "planner_parse_error": meta.get("planner_parse_error", ""),
+            "route_budget_applied": meta.get("route_budget_applied", {}) or {},
             "per_query_retrieval_counts": meta.get("per_query_retrieval_counts", []) or [],
             "rrf_fused_candidate_count": meta.get("rrf_fused_candidate_count", 0),
             "page_level_fusion_enabled": meta.get("page_level_fusion_enabled", False),
@@ -3684,6 +3886,8 @@ def debug_retrieval_pipeline(question: str, top_k: int = 10) -> Dict[str, Any]:
             "evidence_units_with_tables": meta.get("evidence_units_with_tables", 0),
             "table_attached_count": meta.get("table_attached_count", 0),
             "table_attach_reasons": meta.get("table_attach_reasons", []) or [],
+            "table_page_mismatch_count": meta.get("table_page_mismatch_count", 0),
+            "table_page_mismatch_examples": meta.get("table_page_mismatch_examples", []) or [],
             "evidence_group_count": meta.get("evidence_group_count", 0),
             "selected_evidence_group_count": meta.get("selected_evidence_group_count", 0),
             "evidence_groups_debug": meta.get("evidence_groups_debug", []) or [],
