@@ -25,6 +25,7 @@ from finance_rag_features import (
     parse_finance_query,
 )
 from query_parser import matches_company_text
+from query_planner import plan_retrieval_queries
 from milvus_client import MilvusManager
 from parent_chunk_store import ParentChunkStore
 from table_context_builder import (
@@ -1501,6 +1502,91 @@ def _retrieve_leaf_chunks(
             return {"docs": [], "meta": meta}
 
 
+def _planner_query_limit(candidate_k: int) -> int:
+    if candidate_k <= 4:
+        return candidate_k
+    return max(3, min(candidate_k, candidate_k // 2))
+
+
+def _build_retrieval_routes(
+    original_query: str,
+    candidate_k: int,
+    planner: Dict[str, Any],
+) -> list[dict]:
+    planner = planner or {}
+    routes: list[dict] = [
+        {
+            "label": "original",
+            "query": original_query,
+            "weight": 1.0,
+            "top_k": candidate_k,
+            "category": "original",
+        }
+    ]
+    seen = {original_query.strip().lower()}
+    route_limit = _planner_query_limit(candidate_k)
+
+    def _append(items: list[str], label_prefix: str, weight: float, category: str) -> None:
+        for index, item in enumerate(items or [], 1):
+            query = (item or "").strip()
+            lowered = query.lower()
+            if not query or lowered in seen:
+                continue
+            seen.add(lowered)
+            routes.append(
+                {
+                    "label": f"{label_prefix}_{index}",
+                    "query": query,
+                    "weight": weight,
+                    "top_k": route_limit,
+                    "category": category,
+                }
+            )
+
+    _append(planner.get("dense_queries") or [], "dense", 0.75, "dense")
+    _append(planner.get("keyword_queries") or [], "keyword", 0.65, "keyword")
+    _append(planner.get("table_queries") or [], "table", 0.45, "table")
+    return routes
+
+
+def _rrf_fuse_retrieval_routes(
+    route_results: list[dict],
+    *,
+    rrf_k: int = 60,
+) -> list[dict]:
+    fused: dict[tuple, dict] = {}
+    for route in route_results:
+        docs = route.get("docs") or []
+        weight = float(route.get("weight", 1.0) or 1.0)
+        label = route.get("label") or ""
+        query = route.get("query") or ""
+        for rank, doc in enumerate(docs, 1):
+            key = _doc_key(doc)
+            entry = fused.setdefault(
+                key,
+                {
+                    **doc,
+                    "score": 0.0,
+                    "planner_sources": [],
+                    "planner_queries": [],
+                },
+            )
+            entry["score"] = float(entry.get("score", 0.0) or 0.0) + (weight / (rrf_k + rank))
+            if label and label not in entry["planner_sources"]:
+                entry["planner_sources"].append(label)
+            if query and query not in entry["planner_queries"]:
+                entry["planner_queries"].append(query)
+            if _combined_score(doc) > _combined_score(entry):
+                for field, value in doc.items():
+                    if field in {"score", "planner_sources", "planner_queries"}:
+                        continue
+                    entry[field] = value
+    ordered = sorted(fused.values(), key=lambda item: float(item.get("score", 0.0) or 0.0), reverse=True)
+    for rank, doc in enumerate(ordered, 1):
+        doc["rrf_rank"] = rank
+    return ordered
+
+
 def _should_trigger_two_stage_fallback(page_stage_candidates: List[dict], final_top_k: int, query: str) -> bool:
     if len(page_stage_candidates) < final_top_k:
         return True
@@ -2107,6 +2193,15 @@ def retrieve_candidate_documents(query: str, candidate_k: int | None = None) -> 
         "candidate_k": candidate_k,
         "leaf_retrieve_level": LEAF_RETRIEVE_LEVEL,
         "candidate_count": 0,
+        "query_planner_enabled": False,
+        "planner_intent": "",
+        "planner_must_keep_terms": [],
+        "planner_dense_queries": [],
+        "planner_keyword_queries": [],
+        "planner_table_queries": [],
+        "planner_parse_error": "",
+        "per_query_retrieval_counts": [],
+        "rrf_fused_candidate_count": 0,
         "retrieve_error": None,
         "rerank_enabled": bool(RERANK_MODEL and RERANK_API_KEY and RERANK_BINDING_HOST),
         "rerank_applied": False,
@@ -2120,17 +2215,50 @@ def retrieve_candidate_documents(query: str, candidate_k: int | None = None) -> 
         "auto_merge_steps": 0,
     }
     started_at = time.perf_counter()
-    retrieved = _retrieve_leaf_chunks(
-        query,
-        top_k=candidate_k,
-        filter_expr=filter_expr,
-        retrieval_scope="global",
-    )
-    meta = {**base_meta, **retrieved.get("meta", {})}
+    planner = plan_retrieval_queries(query)
+    routes = _build_retrieval_routes(query, candidate_k, planner)
+    route_results: list[dict] = []
+    per_query_retrieval_counts: list[dict] = []
+    last_meta: Dict[str, Any] = {}
+    for route in routes:
+        retrieved = _retrieve_leaf_chunks(
+            route["query"],
+            top_k=route["top_k"],
+            filter_expr=filter_expr,
+            retrieval_scope=f"planned:{route['label']}",
+        )
+        route_results.append({**route, "docs": retrieved.get("docs", []), "meta": retrieved.get("meta", {})})
+        per_query_retrieval_counts.append(
+            {
+                "label": route["label"],
+                "category": route["category"],
+                "query": route["query"],
+                "count": len(retrieved.get("docs", []) or []),
+                "retrieval_mode": (retrieved.get("meta", {}) or {}).get("retrieval_mode", "failed"),
+            }
+        )
+        last_meta = retrieved.get("meta", {}) or {}
+
+    fused_docs = _rrf_fuse_retrieval_routes(route_results)[:candidate_k]
+    meta = {
+        **base_meta,
+        **last_meta,
+        "query_planner_enabled": bool(planner.get("enabled")),
+        "planner_intent": planner.get("intent", ""),
+        "planner_must_keep_terms": planner.get("must_keep_terms", []) or [],
+        "planner_dense_queries": planner.get("dense_queries", []) or [],
+        "planner_keyword_queries": planner.get("keyword_queries", []) or [],
+        "planner_table_queries": planner.get("table_queries", []) or [],
+        "planner_parse_error": planner.get("parse_error", ""),
+        "per_query_retrieval_counts": per_query_retrieval_counts,
+        "rrf_fused_candidate_count": len(fused_docs),
+        "candidate_count": len(fused_docs),
+        "retrieval_mode": "planned_rrf" if len(route_results) > 1 else last_meta.get("retrieval_mode", "failed"),
+    }
     meta["latency_breakdown"] = {
         "initial_retrieval_ms": round((time.perf_counter() - started_at) * 1000, 2),
     }
-    return {"docs": retrieved.get("docs", []), "meta": meta}
+    return {"docs": fused_docs, "meta": meta}
 
 
 def _fetch_neighbor_page_docs(filename: str, page_number: int, page_window: int) -> List[dict]:
@@ -2688,6 +2816,15 @@ def debug_retrieval_pipeline(question: str, top_k: int = 10) -> Dict[str, Any]:
         "query_parse": meta.get("query_parse", {}),
         "rag_trace": {
             "retrieval_mode": meta.get("retrieval_mode", "baseline"),
+            "query_planner_enabled": meta.get("query_planner_enabled", False),
+            "planner_intent": meta.get("planner_intent", ""),
+            "planner_must_keep_terms": meta.get("planner_must_keep_terms", []) or [],
+            "planner_dense_queries": meta.get("planner_dense_queries", []) or [],
+            "planner_keyword_queries": meta.get("planner_keyword_queries", []) or [],
+            "planner_table_queries": meta.get("planner_table_queries", []) or [],
+            "planner_parse_error": meta.get("planner_parse_error", ""),
+            "per_query_retrieval_counts": meta.get("per_query_retrieval_counts", []) or [],
+            "rrf_fused_candidate_count": meta.get("rrf_fused_candidate_count", 0),
             "table_aware_retrieval_mode": meta.get("table_aware_retrieval_mode", "off"),
             "table_aware_auto_triggered": meta.get("table_aware_auto_triggered", False),
             "table_aware_trigger_reason": meta.get("table_aware_trigger_reason", []) or [],

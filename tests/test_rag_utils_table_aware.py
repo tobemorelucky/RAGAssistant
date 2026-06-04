@@ -51,6 +51,20 @@ def _install_rag_utils_stubs():
     query_parser.matches_company_text = lambda *args, **kwargs: False
     sys.modules["query_parser"] = query_parser
 
+    query_planner = types.ModuleType("query_planner")
+    query_planner.plan_retrieval_queries = lambda question: {
+        "enabled": False,
+        "intent": "",
+        "must_keep_terms": [],
+        "dense_queries": [],
+        "keyword_queries": [],
+        "table_queries": [],
+        "expected_evidence_type": "",
+        "constraints": [],
+        "parse_error": "",
+    }
+    sys.modules["query_planner"] = query_planner
+
     milvus_client = types.ModuleType("milvus_client")
     milvus_client.MilvusManager = type("MilvusManager", (), {})
     sys.modules["milvus_client"] = milvus_client
@@ -578,6 +592,15 @@ def test_debug_retrieval_pipeline_exposes_table_aware_trace_fields(monkeypatch):
             "context_docs": [],
             "meta": {
                 "retrieval_mode": "baseline",
+                "query_planner_enabled": True,
+                "planner_intent": "numeric_lookup",
+                "planner_must_keep_terms": ["Adobe", "2022"],
+                "planner_dense_queries": ["Adobe operating margin 2022"],
+                "planner_keyword_queries": ["Adobe margin 2022"],
+                "planner_table_queries": [],
+                "planner_parse_error": "",
+                "per_query_retrieval_counts": [{"label": "original", "count": 3}],
+                "rrf_fused_candidate_count": 4,
                 "table_aware_retrieval_mode": "force",
                 "table_aware_auto_triggered": True,
                 "table_aware_trigger_reason": ["force"],
@@ -600,6 +623,15 @@ def test_debug_retrieval_pipeline_exposes_table_aware_trace_fields(monkeypatch):
     result = module.debug_retrieval_pipeline("net sales", top_k=5)
     trace = result["rag_trace"]
 
+    assert trace["query_planner_enabled"] is True
+    assert trace["planner_intent"] == "numeric_lookup"
+    assert trace["planner_must_keep_terms"] == ["Adobe", "2022"]
+    assert trace["planner_dense_queries"] == ["Adobe operating margin 2022"]
+    assert trace["planner_keyword_queries"] == ["Adobe margin 2022"]
+    assert trace["planner_table_queries"] == []
+    assert trace["planner_parse_error"] == ""
+    assert trace["per_query_retrieval_counts"] == [{"label": "original", "count": 3}]
+    assert trace["rrf_fused_candidate_count"] == 4
     assert trace["table_aware_retrieval_mode"] == "force"
     assert trace["table_aware_auto_triggered"] is True
     assert trace["table_aware_trigger_reason"] == ["force"]
@@ -846,3 +878,93 @@ def test_retrieve_documents_auto_non_table_query_does_not_force_table_attachment
     assert result["context_docs"] == [doc]
     assert result["meta"]["evidence_units_with_tables"] == 0
     assert result["meta"]["table_context_source"] == "none"
+
+
+def test_retrieve_candidate_documents_uses_query_planner_and_rrf(monkeypatch):
+    module = _install_rag_utils_stubs()
+    calls = []
+
+    monkeypatch.setattr(
+        module,
+        "plan_retrieval_queries",
+        lambda question: {
+            "enabled": True,
+            "intent": "numeric_lookup",
+            "must_keep_terms": ["Adobe", "2022"],
+            "dense_queries": ["Adobe operating margin 2022"],
+            "keyword_queries": ["Adobe margin 2022"],
+            "table_queries": [],
+            "expected_evidence_type": "text",
+            "constraints": [],
+            "parse_error": "",
+        },
+    )
+
+    def _fake_retrieve_leaf_chunks(query, top_k, filter_expr, retrieval_scope):
+        calls.append({"query": query, "top_k": top_k, "filter_expr": filter_expr, "scope": retrieval_scope})
+        docs_map = {
+            "What was Adobe operating margin in 2022?": [
+                {"filename": "1.pdf", "chunk_id": "c1", "text": "Adobe operating margin was 35% in 2022.", "score": 0.4}
+            ],
+            "Adobe operating margin 2022": [
+                {"filename": "1.pdf", "chunk_id": "c1", "text": "Adobe operating margin was 35% in 2022.", "score": 0.3},
+                {"filename": "1.pdf", "chunk_id": "c2", "text": "Operating margin expanded in 2022.", "score": 0.2},
+            ],
+            "Adobe margin 2022": [
+                {"filename": "1.pdf", "chunk_id": "c2", "text": "Operating margin expanded in 2022.", "score": 0.5}
+            ],
+        }
+        return {"docs": docs_map.get(query, []), "meta": {"retrieval_mode": "hybrid"}}
+
+    monkeypatch.setattr(module, "_retrieve_leaf_chunks", _fake_retrieve_leaf_chunks)
+
+    result = module.retrieve_candidate_documents("What was Adobe operating margin in 2022?", candidate_k=6)
+
+    assert [item["query"] for item in calls] == [
+        "What was Adobe operating margin in 2022?",
+        "Adobe operating margin 2022",
+        "Adobe margin 2022",
+    ]
+    assert result["meta"]["query_planner_enabled"] is True
+    assert result["meta"]["planner_dense_queries"] == ["Adobe operating margin 2022"]
+    assert result["meta"]["planner_keyword_queries"] == ["Adobe margin 2022"]
+    assert result["meta"]["rrf_fused_candidate_count"] == 2
+    assert len(result["meta"]["per_query_retrieval_counts"]) == 3
+    assert result["docs"][0]["chunk_id"] == "c1"
+
+
+def test_retrieve_candidate_documents_planner_failure_falls_back_to_original_query(monkeypatch):
+    module = _install_rag_utils_stubs()
+    calls = []
+
+    monkeypatch.setattr(
+        module,
+        "plan_retrieval_queries",
+        lambda question: {
+            "enabled": False,
+            "intent": "",
+            "must_keep_terms": [],
+            "dense_queries": [],
+            "keyword_queries": [],
+            "table_queries": [],
+            "expected_evidence_type": "",
+            "constraints": [],
+            "parse_error": "planner_failed",
+        },
+    )
+
+    def _fake_retrieve_leaf_chunks(query, top_k, filter_expr, retrieval_scope):
+        calls.append(query)
+        return {
+            "docs": [{"filename": "1.pdf", "chunk_id": "c1", "text": "Fallback original query result.", "score": 0.3}],
+            "meta": {"retrieval_mode": "hybrid"},
+        }
+
+    monkeypatch.setattr(module, "_retrieve_leaf_chunks", _fake_retrieve_leaf_chunks)
+
+    result = module.retrieve_candidate_documents("Summarize this document.", candidate_k=5)
+
+    assert calls == ["Summarize this document."]
+    assert result["meta"]["query_planner_enabled"] is False
+    assert result["meta"]["planner_parse_error"] == "planner_failed"
+    assert result["docs"][0]["chunk_id"] == "c1"
