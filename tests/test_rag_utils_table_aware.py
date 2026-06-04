@@ -56,9 +56,11 @@ def _install_rag_utils_stubs():
         "enabled": False,
         "intent": "",
         "must_keep_terms": [],
-        "dense_queries": [],
+        "semantic_queries": [],
+        "evidence_field_queries": [],
+        "table_heading_queries": [],
         "keyword_queries": [],
-        "table_queries": [],
+        "planner_validation_dropped_queries": [],
         "expected_evidence_type": "",
         "constraints": [],
         "parse_error": "",
@@ -596,11 +598,19 @@ def test_debug_retrieval_pipeline_exposes_table_aware_trace_fields(monkeypatch):
                 "planner_intent": "numeric_lookup",
                 "planner_must_keep_terms": ["Adobe", "2022"],
                 "planner_dense_queries": ["Adobe operating margin 2022"],
+                "planner_semantic_queries": ["Adobe operating margin 2022"],
+                "planner_evidence_field_queries": ["Adobe revenue income from operations 2022"],
+                "planner_table_heading_queries": ["Adobe statements of income 2022"],
                 "planner_keyword_queries": ["Adobe margin 2022"],
                 "planner_table_queries": [],
+                "planner_validation_dropped_queries": [{"field": "semantic_queries", "query": "AES operating margin 2022", "reason": "validation_failed"}],
                 "planner_parse_error": "",
                 "per_query_retrieval_counts": [{"label": "original", "count": 3}],
                 "rrf_fused_candidate_count": 4,
+                "page_level_fusion_enabled": True,
+                "fused_page_count": 2,
+                "fused_top_pages": [{"filename": "demo.pdf", "page_number": 8, "page_score": 1.2, "matched_queries": ["Adobe margin 2022"], "contributing_routes": ["original", "semantic_1"]}],
+                "page_contributing_routes": {"demo.pdf#page=8": ["original", "semantic_1"]},
                 "table_aware_retrieval_mode": "force",
                 "table_aware_auto_triggered": True,
                 "table_aware_trigger_reason": ["force"],
@@ -627,11 +637,21 @@ def test_debug_retrieval_pipeline_exposes_table_aware_trace_fields(monkeypatch):
     assert trace["planner_intent"] == "numeric_lookup"
     assert trace["planner_must_keep_terms"] == ["Adobe", "2022"]
     assert trace["planner_dense_queries"] == ["Adobe operating margin 2022"]
+    assert trace["planner_semantic_queries"] == ["Adobe operating margin 2022"]
+    assert trace["planner_evidence_field_queries"] == ["Adobe revenue income from operations 2022"]
+    assert trace["planner_table_heading_queries"] == ["Adobe statements of income 2022"]
     assert trace["planner_keyword_queries"] == ["Adobe margin 2022"]
     assert trace["planner_table_queries"] == []
+    assert trace["planner_validation_dropped_queries"] == [
+        {"field": "semantic_queries", "query": "AES operating margin 2022", "reason": "validation_failed"}
+    ]
     assert trace["planner_parse_error"] == ""
     assert trace["per_query_retrieval_counts"] == [{"label": "original", "count": 3}]
     assert trace["rrf_fused_candidate_count"] == 4
+    assert trace["page_level_fusion_enabled"] is True
+    assert trace["fused_page_count"] == 2
+    assert trace["fused_top_pages"][0]["filename"] == "demo.pdf"
+    assert trace["page_contributing_routes"] == {"demo.pdf#page=8": ["original", "semantic_1"]}
     assert trace["table_aware_retrieval_mode"] == "force"
     assert trace["table_aware_auto_triggered"] is True
     assert trace["table_aware_trigger_reason"] == ["force"]
@@ -884,6 +904,7 @@ def test_retrieve_candidate_documents_uses_query_planner_and_rrf(monkeypatch):
     module = _install_rag_utils_stubs()
     calls = []
 
+    monkeypatch.setenv("RAG_QUERY_PLANNER_ENABLED", "true")
     monkeypatch.setattr(
         module,
         "plan_retrieval_queries",
@@ -891,9 +912,11 @@ def test_retrieve_candidate_documents_uses_query_planner_and_rrf(monkeypatch):
             "enabled": True,
             "intent": "numeric_lookup",
             "must_keep_terms": ["Adobe", "2022"],
-            "dense_queries": ["Adobe operating margin 2022"],
+            "semantic_queries": ["Adobe operating margin 2022"],
+            "evidence_field_queries": ["Adobe revenue income from operations 2022"],
+            "table_heading_queries": ["Adobe statements of income 2022"],
             "keyword_queries": ["Adobe margin 2022"],
-            "table_queries": [],
+            "planner_validation_dropped_queries": [],
             "expected_evidence_type": "text",
             "constraints": [],
             "parse_error": "",
@@ -904,14 +927,20 @@ def test_retrieve_candidate_documents_uses_query_planner_and_rrf(monkeypatch):
         calls.append({"query": query, "top_k": top_k, "filter_expr": filter_expr, "scope": retrieval_scope})
         docs_map = {
             "What was Adobe operating margin in 2022?": [
-                {"filename": "1.pdf", "chunk_id": "c1", "text": "Adobe operating margin was 35% in 2022.", "score": 0.4}
+                {"filename": "1.pdf", "page_number": 8, "chunk_id": "c1", "text": "Adobe operating margin was 35% in 2022.", "score": 0.4}
             ],
             "Adobe operating margin 2022": [
-                {"filename": "1.pdf", "chunk_id": "c1", "text": "Adobe operating margin was 35% in 2022.", "score": 0.3},
-                {"filename": "1.pdf", "chunk_id": "c2", "text": "Operating margin expanded in 2022.", "score": 0.2},
+                {"filename": "1.pdf", "page_number": 8, "chunk_id": "c1", "text": "Adobe operating margin was 35% in 2022.", "score": 0.3},
+                {"filename": "1.pdf", "page_number": 8, "chunk_id": "c2", "text": "Operating margin expanded in 2022.", "score": 0.2},
+            ],
+            "Adobe revenue income from operations 2022": [
+                {"filename": "1.pdf", "page_number": 8, "chunk_id": "c3", "text": "Income from operations was $12.4 billion in 2022.", "score": 0.45}
+            ],
+            "Adobe statements of income 2022": [
+                {"filename": "1.pdf", "page_number": 8, "chunk_id": "c4", "text": "Statements of income for fiscal 2022.", "score": 0.35}
             ],
             "Adobe margin 2022": [
-                {"filename": "1.pdf", "chunk_id": "c2", "text": "Operating margin expanded in 2022.", "score": 0.5}
+                {"filename": "1.pdf", "page_number": 9, "chunk_id": "c2", "text": "Operating margin expanded in 2022.", "score": 0.5}
             ],
         }
         return {"docs": docs_map.get(query, []), "meta": {"retrieval_mode": "hybrid"}}
@@ -923,13 +952,27 @@ def test_retrieve_candidate_documents_uses_query_planner_and_rrf(monkeypatch):
     assert [item["query"] for item in calls] == [
         "What was Adobe operating margin in 2022?",
         "Adobe operating margin 2022",
+        "Adobe revenue income from operations 2022",
+        "Adobe statements of income 2022",
         "Adobe margin 2022",
     ]
     assert result["meta"]["query_planner_enabled"] is True
     assert result["meta"]["planner_dense_queries"] == ["Adobe operating margin 2022"]
+    assert result["meta"]["planner_semantic_queries"] == ["Adobe operating margin 2022"]
+    assert result["meta"]["planner_evidence_field_queries"] == ["Adobe revenue income from operations 2022"]
+    assert result["meta"]["planner_table_heading_queries"] == ["Adobe statements of income 2022"]
     assert result["meta"]["planner_keyword_queries"] == ["Adobe margin 2022"]
-    assert result["meta"]["rrf_fused_candidate_count"] == 2
-    assert len(result["meta"]["per_query_retrieval_counts"]) == 3
+    assert result["meta"]["rrf_fused_candidate_count"] == 5
+    assert result["meta"]["page_level_fusion_enabled"] is True
+    assert result["meta"]["fused_page_count"] == 2
+    assert result["meta"]["fused_top_pages"][0]["page_number"] == 8
+    assert set(result["meta"]["page_contributing_routes"]["1.pdf#page=8"]) == {
+        "original",
+        "semantic_1",
+        "evidence_field_1",
+        "table_heading_1",
+    }
+    assert len(result["meta"]["per_query_retrieval_counts"]) == 5
     assert result["docs"][0]["chunk_id"] == "c1"
 
 
@@ -937,6 +980,7 @@ def test_retrieve_candidate_documents_planner_failure_falls_back_to_original_que
     module = _install_rag_utils_stubs()
     calls = []
 
+    monkeypatch.setenv("RAG_QUERY_PLANNER_ENABLED", "true")
     monkeypatch.setattr(
         module,
         "plan_retrieval_queries",
@@ -944,9 +988,11 @@ def test_retrieve_candidate_documents_planner_failure_falls_back_to_original_que
             "enabled": False,
             "intent": "",
             "must_keep_terms": [],
-            "dense_queries": [],
+            "semantic_queries": [],
+            "evidence_field_queries": [],
+            "table_heading_queries": [],
             "keyword_queries": [],
-            "table_queries": [],
+            "planner_validation_dropped_queries": [],
             "expected_evidence_type": "",
             "constraints": [],
             "parse_error": "planner_failed",
@@ -965,6 +1011,52 @@ def test_retrieve_candidate_documents_planner_failure_falls_back_to_original_que
     result = module.retrieve_candidate_documents("Summarize this document.", candidate_k=5)
 
     assert calls == ["Summarize this document."]
-    assert result["meta"]["query_planner_enabled"] is False
+    assert result["meta"]["query_planner_enabled"] is True
+    assert result["meta"]["planner_dense_queries"] == []
+    assert result["meta"]["planner_semantic_queries"] == []
+    assert result["meta"]["planner_evidence_field_queries"] == []
+    assert result["meta"]["planner_table_heading_queries"] == []
+    assert result["meta"]["planner_keyword_queries"] == []
+    assert result["meta"]["planner_table_queries"] == []
     assert result["meta"]["planner_parse_error"] == "planner_failed"
     assert result["docs"][0]["chunk_id"] == "c1"
+
+
+def test_retrieve_candidate_documents_does_not_call_planner_when_disabled(monkeypatch):
+    module = _install_rag_utils_stubs()
+    calls = []
+
+    monkeypatch.delenv("RAG_QUERY_PLANNER_ENABLED", raising=False)
+
+    def _fail_planner(question):
+        raise AssertionError("planner should not be called when disabled")
+
+    def _fake_retrieve_leaf_chunks(query, top_k, filter_expr, retrieval_scope):
+        calls.append(query)
+        return {
+            "docs": [{"filename": "1.pdf", "chunk_id": "c1", "text": "Original query result.", "score": 0.3}],
+            "meta": {"retrieval_mode": "hybrid"},
+        }
+
+    monkeypatch.setattr(module, "plan_retrieval_queries", _fail_planner)
+    monkeypatch.setattr(module, "_retrieve_leaf_chunks", _fake_retrieve_leaf_chunks)
+
+    result = module.retrieve_candidate_documents("What was revenue?", candidate_k=5)
+
+    assert calls == ["What was revenue?"]
+    assert result["meta"]["query_planner_enabled"] is False
+    assert result["meta"]["planner_dense_queries"] == []
+    assert result["meta"]["planner_semantic_queries"] == []
+    assert result["meta"]["planner_evidence_field_queries"] == []
+    assert result["meta"]["planner_table_heading_queries"] == []
+    assert result["meta"]["planner_keyword_queries"] == []
+    assert result["meta"]["planner_table_queries"] == []
+    assert result["meta"]["per_query_retrieval_counts"] == [
+        {
+            "label": "original",
+            "category": "original",
+            "query": "What was revenue?",
+            "count": 1,
+            "retrieval_mode": "hybrid",
+        }
+    ]

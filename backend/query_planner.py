@@ -93,6 +93,13 @@ _GENERIC_EXPLANATION_HINTS = (
     "overview of",
 )
 
+_QUERY_GROUP_LIMITS = {
+    "semantic_queries": 2,
+    "evidence_field_queries": 2,
+    "table_heading_queries": 2,
+    "keyword_queries": 2,
+}
+
 
 def _get_planner_model():
     global _PLANNER_MODEL
@@ -205,9 +212,11 @@ def _default_plan(question: str, parse_error: str = "") -> Dict[str, Any]:
         "enabled": False,
         "intent": "",
         "must_keep_terms": must_keep_terms,
-        "dense_queries": [],
+        "semantic_queries": [],
+        "evidence_field_queries": [],
+        "table_heading_queries": [],
         "keyword_queries": [],
-        "table_queries": [],
+        "planner_validation_dropped_queries": [],
         "expected_evidence_type": "",
         "constraints": [],
         "parse_error": parse_error,
@@ -235,7 +244,7 @@ def _validate_query(
     query: str,
     *,
     original_anchors: list[str],
-    original_numbers: list[str],
+    original_years: list[str],
 ) -> bool:
     text = (query or "").strip()
     if len(text) < 3:
@@ -245,21 +254,21 @@ def _validate_query(
         return False
     generated_anchors = {item.lower() for item in _extract_anchors(text)}
     original_anchor_set = {item.lower() for item in original_anchors}
-    if original_anchor_set and not original_anchor_set.issubset({token.lower() for token in re.findall(r"[A-Za-z0-9&'.-]+", text)} | generated_anchors):
-        return False
-    if original_numbers:
-        generated_numbers = set(_extract_numbers(text))
-        if not set(original_numbers).issubset(generated_numbers):
-            return False
     new_anchors = generated_anchors - original_anchor_set
     if new_anchors:
         return False
+    if original_years:
+        query_years = set(_YEAR_PATTERN.findall(text))
+        new_years = query_years - set(original_years)
+        if new_years:
+            return False
     return True
 
 
 def _sanitize_planner_output(question: str, raw: Dict[str, Any]) -> Dict[str, Any]:
     original_anchors = _extract_anchors(question)
     original_numbers = _extract_numbers(question)
+    original_years = _YEAR_PATTERN.findall(question or "")
     must_keep_terms = []
     seen_keep = set()
     for item in list(raw.get("must_keep_terms") or []) + original_anchors + original_numbers:
@@ -272,26 +281,60 @@ def _sanitize_planner_output(question: str, raw: Dict[str, Any]) -> Dict[str, An
         seen_keep.add(lowered)
         must_keep_terms.append(text)
 
-    dense_queries = [
-        query for query in _clean_queries(raw.get("dense_queries"), 2)
-        if _validate_query(query, original_anchors=original_anchors, original_numbers=original_numbers)
-    ]
-    keyword_queries = [
-        query for query in _clean_queries(raw.get("keyword_queries"), 2)
-        if _validate_query(query, original_anchors=original_anchors, original_numbers=original_numbers)
-    ]
-    table_queries = [
-        query for query in _clean_queries(raw.get("table_queries"), 1)
-        if _validate_query(query, original_anchors=original_anchors, original_numbers=original_numbers)
-    ]
+    dropped_queries: list[dict] = []
+
+    def _sanitize_group(field_name: str) -> list[str]:
+        cleaned = _clean_queries(raw.get(field_name), _QUERY_GROUP_LIMITS[field_name])
+        accepted: list[str] = []
+        for query in cleaned:
+            if _validate_query(
+                query,
+                original_anchors=original_anchors,
+                original_years=original_years,
+            ):
+                accepted.append(query)
+            else:
+                dropped_queries.append(
+                    {
+                        "field": field_name,
+                        "query": query,
+                        "reason": "validation_failed",
+                    }
+                )
+        return accepted
+
+    semantic_queries = _sanitize_group("semantic_queries")
+    evidence_field_queries = _sanitize_group("evidence_field_queries")
+    table_heading_queries = _sanitize_group("table_heading_queries")
+    keyword_queries = _sanitize_group("keyword_queries")
+
+    coverage_text = "\n".join(
+        [
+            " ".join(must_keep_terms),
+            " ".join(semantic_queries),
+            " ".join(evidence_field_queries),
+            " ".join(table_heading_queries),
+            " ".join(keyword_queries),
+        ]
+    )
+    coverage_anchors = {item.lower() for item in _extract_anchors(coverage_text)}
+    coverage_numbers = set(_extract_numbers(coverage_text))
+    for anchor in original_anchors:
+        if anchor.lower() not in coverage_anchors and anchor.lower() not in {item.lower() for item in must_keep_terms}:
+            must_keep_terms.append(anchor)
+    for number in original_numbers:
+        if number not in coverage_numbers and number not in must_keep_terms:
+            must_keep_terms.append(number)
 
     return {
         "enabled": True,
         "intent": str(raw.get("intent") or "").strip(),
         "must_keep_terms": must_keep_terms,
-        "dense_queries": dense_queries,
+        "semantic_queries": semantic_queries,
+        "evidence_field_queries": evidence_field_queries,
+        "table_heading_queries": table_heading_queries,
         "keyword_queries": keyword_queries,
-        "table_queries": table_queries,
+        "planner_validation_dropped_queries": dropped_queries,
         "expected_evidence_type": str(raw.get("expected_evidence_type") or "").strip(),
         "constraints": [str(item).strip() for item in (raw.get("constraints") or []) if str(item).strip()],
         "parse_error": "",
@@ -310,17 +353,21 @@ def plan_retrieval_queries(question: str) -> Dict[str, Any]:
     system_prompt = (
         "You are a retrieval query planner for RAG. "
         "Return JSON only. Do not answer the user's question. "
-        "Preserve original entities, numbers, dates, and years. "
-        "Do not invent new entities. Do not turn the question into a generic concept explanation. "
-        "Generate at most 2 dense_queries, 2 keyword_queries, and 1 table_queries. "
+        "Do not answer the question. "
+        "Generate retrieval queries that match how evidence may appear in documents. "
+        "Preserve original companies, entities, dates, years, and numbers. "
+        "Do not invent new companies, people, products, dates, or years. "
+        "You may add generic evidence fields, row labels, table headers, or metric components needed to find evidence. "
+        "Do not turn the question into a generic concept explanation. "
+        "Generate at most 2 semantic_queries, 2 evidence_field_queries, 2 keyword_queries, and 2 table_heading_queries. "
         "Use retrieval-oriented wording that may help find matching document text, table rows, row labels, column labels, or numeric evidence. "
         "The original user question will always be searched separately and remains highest priority."
     )
     user_prompt = (
         "Plan retrieval queries for this question.\n"
         f"Question: {text}\n\n"
-        "Return JSON with keys: intent, must_keep_terms, dense_queries, keyword_queries, "
-        "table_queries, expected_evidence_type, constraints."
+        "Return JSON with keys: intent, must_keep_terms, semantic_queries, evidence_field_queries, "
+        "table_heading_queries, keyword_queries, expected_evidence_type, constraints."
     )
 
     try:

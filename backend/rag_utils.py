@@ -1508,6 +1508,14 @@ def _planner_query_limit(candidate_k: int) -> int:
     return max(3, min(candidate_k, candidate_k // 2))
 
 
+def _is_query_planner_enabled() -> bool:
+    return _parse_bool(os.getenv("RAG_QUERY_PLANNER_ENABLED"), False)
+
+
+def _is_page_level_fusion_enabled() -> bool:
+    return _parse_bool(os.getenv("RAG_PAGE_LEVEL_FUSION"), True)
+
+
 def _build_retrieval_routes(
     original_query: str,
     candidate_k: int,
@@ -1543,9 +1551,10 @@ def _build_retrieval_routes(
                 }
             )
 
-    _append(planner.get("dense_queries") or [], "dense", 0.75, "dense")
+    _append(planner.get("semantic_queries") or [], "semantic", 0.75, "semantic")
+    _append(planner.get("evidence_field_queries") or [], "evidence_field", 0.85, "evidence_field")
+    _append(planner.get("table_heading_queries") or [], "table_heading", 0.55, "table_heading")
     _append(planner.get("keyword_queries") or [], "keyword", 0.65, "keyword")
-    _append(planner.get("table_queries") or [], "table", 0.45, "table")
     return routes
 
 
@@ -1585,6 +1594,117 @@ def _rrf_fuse_retrieval_routes(
     for rank, doc in enumerate(ordered, 1):
         doc["rrf_rank"] = rank
     return ordered
+
+
+def _page_fusion_key(doc: dict) -> tuple[str, int] | None:
+    filename = (doc.get("filename") or "").strip()
+    page_number = _coerce_int(doc.get("page_number"))
+    if not filename or page_number is None:
+        return None
+    return filename, page_number
+
+
+def _fuse_retrieval_pages(
+    route_results: list[dict],
+    *,
+    rrf_k: int = 60,
+) -> list[dict]:
+    pages: dict[tuple[str, int], dict] = {}
+    for route in route_results:
+        docs = route.get("docs") or []
+        weight = float(route.get("weight", 1.0) or 1.0)
+        label = route.get("label") or ""
+        query = route.get("query") or ""
+        for rank, doc in enumerate(docs, 1):
+            key = _page_fusion_key(doc)
+            if key is None:
+                continue
+            filename, page_number = key
+            contribution = weight / (rrf_k + rank)
+            entry = pages.setdefault(
+                key,
+                {
+                    "filename": filename,
+                    "page_number": page_number,
+                    "page_score": 0.0,
+                    "contributing_routes": [],
+                    "matched_queries": [],
+                    "top_chunks": [],
+                },
+            )
+            entry["page_score"] += contribution
+            if label and label not in entry["contributing_routes"]:
+                entry["contributing_routes"].append(label)
+            if query and query not in entry["matched_queries"]:
+                entry["matched_queries"].append(query)
+            entry["top_chunks"].append(
+                {
+                    "chunk_id": doc.get("chunk_id", "") or "",
+                    "text": doc.get("text", "") or "",
+                    "score": _combined_score(doc),
+                    "route": label,
+                    "query": query,
+                }
+            )
+    ordered = sorted(pages.values(), key=lambda item: float(item.get("page_score", 0.0) or 0.0), reverse=True)
+    for entry in ordered:
+        entry["top_chunks"] = sorted(
+            entry.get("top_chunks", []),
+            key=lambda item: float(item.get("score", 0.0) or 0.0),
+            reverse=True,
+        )[:3]
+    return ordered
+
+
+def _apply_page_level_fusion(
+    fused_docs: list[dict],
+    route_results: list[dict],
+    *,
+    candidate_k: int,
+) -> tuple[list[dict], list[dict]]:
+    fused_pages = _fuse_retrieval_pages(route_results)
+    if not fused_pages:
+        return fused_docs[:candidate_k], []
+
+    page_rank_map = {
+        (entry["filename"], entry["page_number"]): index
+        for index, entry in enumerate(fused_pages, 1)
+    }
+    page_score_map = {
+        (entry["filename"], entry["page_number"]): float(entry.get("page_score", 0.0) or 0.0)
+        for entry in fused_pages
+    }
+    page_meta_map = {
+        (entry["filename"], entry["page_number"]): entry
+        for entry in fused_pages
+    }
+
+    prioritized_docs: list[dict] = []
+    for doc in fused_docs:
+        page_key = _page_fusion_key(doc)
+        if page_key is None:
+            prioritized_docs.append(doc)
+            continue
+        page_meta = page_meta_map.get(page_key, {})
+        prioritized_docs.append(
+            {
+                **doc,
+                "page_fused_score": page_score_map.get(page_key, 0.0),
+                "page_fused_rank": page_rank_map.get(page_key, 10**9),
+                "page_contributing_routes": list(page_meta.get("contributing_routes", [])),
+                "page_matched_queries": list(page_meta.get("matched_queries", [])),
+            }
+        )
+
+    prioritized_docs.sort(
+        key=lambda item: (
+            int(item.get("page_fused_rank", 10**9)),
+            -float(item.get("page_fused_score", 0.0) or 0.0),
+            -float(item.get("score", 0.0) or 0.0),
+            -float(item.get("rerank_score", 0.0) or 0.0),
+        )
+    )
+    return prioritized_docs[:candidate_k], fused_pages
 
 
 def _should_trigger_two_stage_fallback(page_stage_candidates: List[dict], final_top_k: int, query: str) -> bool:
@@ -2197,11 +2317,19 @@ def retrieve_candidate_documents(query: str, candidate_k: int | None = None) -> 
         "planner_intent": "",
         "planner_must_keep_terms": [],
         "planner_dense_queries": [],
+        "planner_semantic_queries": [],
+        "planner_evidence_field_queries": [],
+        "planner_table_heading_queries": [],
         "planner_keyword_queries": [],
         "planner_table_queries": [],
+        "planner_validation_dropped_queries": [],
         "planner_parse_error": "",
         "per_query_retrieval_counts": [],
         "rrf_fused_candidate_count": 0,
+        "page_level_fusion_enabled": False,
+        "fused_page_count": 0,
+        "fused_top_pages": [],
+        "page_contributing_routes": {},
         "retrieve_error": None,
         "rerank_enabled": bool(RERANK_MODEL and RERANK_API_KEY and RERANK_BINDING_HOST),
         "rerank_applied": False,
@@ -2215,7 +2343,20 @@ def retrieve_candidate_documents(query: str, candidate_k: int | None = None) -> 
         "auto_merge_steps": 0,
     }
     started_at = time.perf_counter()
-    planner = plan_retrieval_queries(query)
+    planner_enabled = _is_query_planner_enabled()
+    planner = plan_retrieval_queries(query) if planner_enabled else {
+        "enabled": False,
+        "intent": "",
+        "must_keep_terms": [],
+        "semantic_queries": [],
+        "evidence_field_queries": [],
+        "table_heading_queries": [],
+        "keyword_queries": [],
+        "planner_validation_dropped_queries": [],
+        "expected_evidence_type": "",
+        "constraints": [],
+        "parse_error": "",
+    }
     routes = _build_retrieval_routes(query, candidate_k, planner)
     route_results: list[dict] = []
     per_query_retrieval_counts: list[dict] = []
@@ -2239,19 +2380,49 @@ def retrieve_candidate_documents(query: str, candidate_k: int | None = None) -> 
         )
         last_meta = retrieved.get("meta", {}) or {}
 
-    fused_docs = _rrf_fuse_retrieval_routes(route_results)[:candidate_k]
+    fused_docs_all = _rrf_fuse_retrieval_routes(route_results)
+    page_level_fusion_enabled = planner_enabled and _is_page_level_fusion_enabled()
+    if page_level_fusion_enabled:
+        fused_docs, fused_pages = _apply_page_level_fusion(
+            fused_docs_all,
+            route_results,
+            candidate_k=candidate_k,
+        )
+    else:
+        fused_docs = fused_docs_all[:candidate_k]
+        fused_pages = []
     meta = {
         **base_meta,
         **last_meta,
-        "query_planner_enabled": bool(planner.get("enabled")),
+        "query_planner_enabled": planner_enabled,
         "planner_intent": planner.get("intent", ""),
         "planner_must_keep_terms": planner.get("must_keep_terms", []) or [],
-        "planner_dense_queries": planner.get("dense_queries", []) or [],
+        "planner_dense_queries": planner.get("semantic_queries", []) or [],
+        "planner_semantic_queries": planner.get("semantic_queries", []) or [],
+        "planner_evidence_field_queries": planner.get("evidence_field_queries", []) or [],
+        "planner_table_heading_queries": planner.get("table_heading_queries", []) or [],
         "planner_keyword_queries": planner.get("keyword_queries", []) or [],
-        "planner_table_queries": planner.get("table_queries", []) or [],
+        "planner_table_queries": planner.get("table_heading_queries", []) or [],
+        "planner_validation_dropped_queries": planner.get("planner_validation_dropped_queries", []) or [],
         "planner_parse_error": planner.get("parse_error", ""),
         "per_query_retrieval_counts": per_query_retrieval_counts,
-        "rrf_fused_candidate_count": len(fused_docs),
+        "rrf_fused_candidate_count": len(fused_docs_all),
+        "page_level_fusion_enabled": page_level_fusion_enabled,
+        "fused_page_count": len(fused_pages),
+        "fused_top_pages": [
+            {
+                "filename": entry.get("filename", "") or "",
+                "page_number": entry.get("page_number", ""),
+                "page_score": entry.get("page_score", 0.0),
+                "matched_queries": entry.get("matched_queries", []) or [],
+                "contributing_routes": entry.get("contributing_routes", []) or [],
+            }
+            for entry in fused_pages[:candidate_k]
+        ],
+        "page_contributing_routes": {
+            f"{entry.get('filename', '')}#page={entry.get('page_number', '')}": entry.get("contributing_routes", []) or []
+            for entry in fused_pages[:candidate_k]
+        },
         "candidate_count": len(fused_docs),
         "retrieval_mode": "planned_rrf" if len(route_results) > 1 else last_meta.get("retrieval_mode", "failed"),
     }
@@ -2820,11 +2991,19 @@ def debug_retrieval_pipeline(question: str, top_k: int = 10) -> Dict[str, Any]:
             "planner_intent": meta.get("planner_intent", ""),
             "planner_must_keep_terms": meta.get("planner_must_keep_terms", []) or [],
             "planner_dense_queries": meta.get("planner_dense_queries", []) or [],
+            "planner_semantic_queries": meta.get("planner_semantic_queries", []) or [],
+            "planner_evidence_field_queries": meta.get("planner_evidence_field_queries", []) or [],
+            "planner_table_heading_queries": meta.get("planner_table_heading_queries", []) or [],
             "planner_keyword_queries": meta.get("planner_keyword_queries", []) or [],
             "planner_table_queries": meta.get("planner_table_queries", []) or [],
+            "planner_validation_dropped_queries": meta.get("planner_validation_dropped_queries", []) or [],
             "planner_parse_error": meta.get("planner_parse_error", ""),
             "per_query_retrieval_counts": meta.get("per_query_retrieval_counts", []) or [],
             "rrf_fused_candidate_count": meta.get("rrf_fused_candidate_count", 0),
+            "page_level_fusion_enabled": meta.get("page_level_fusion_enabled", False),
+            "fused_page_count": meta.get("fused_page_count", 0),
+            "fused_top_pages": meta.get("fused_top_pages", []) or [],
+            "page_contributing_routes": meta.get("page_contributing_routes", {}) or {},
             "table_aware_retrieval_mode": meta.get("table_aware_retrieval_mode", "off"),
             "table_aware_auto_triggered": meta.get("table_aware_auto_triggered", False),
             "table_aware_trigger_reason": meta.get("table_aware_trigger_reason", []) or [],
