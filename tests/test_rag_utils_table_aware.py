@@ -610,7 +610,11 @@ def test_debug_retrieval_pipeline_exposes_table_aware_trace_fields(monkeypatch):
                 "page_level_fusion_enabled": True,
                 "fused_page_count": 2,
                 "fused_top_pages": [{"filename": "demo.pdf", "page_number": 8, "page_score": 1.2, "matched_queries": ["Adobe margin 2022"], "contributing_routes": ["original", "semantic_1"]}],
+                "fused_pages_after_anchor_guard": [{"filename": "demo.pdf", "page_number": 8, "page_score": 1.2, "matched_queries": ["Adobe margin 2022"], "contributing_routes": ["original", "semantic_1"]}],
+                "page_anchor_filtered_count": 2,
                 "page_contributing_routes": {"demo.pdf#page=8": ["original", "semantic_1"]},
+                "page_fusion_used_for_final_context": True,
+                "final_evidence_pack_source": "page_fusion",
                 "table_aware_retrieval_mode": "force",
                 "table_aware_auto_triggered": True,
                 "table_aware_trigger_reason": ["force"],
@@ -651,7 +655,11 @@ def test_debug_retrieval_pipeline_exposes_table_aware_trace_fields(monkeypatch):
     assert trace["page_level_fusion_enabled"] is True
     assert trace["fused_page_count"] == 2
     assert trace["fused_top_pages"][0]["filename"] == "demo.pdf"
+    assert trace["fused_pages_after_anchor_guard"][0]["filename"] == "demo.pdf"
+    assert trace["page_anchor_filtered_count"] == 2
     assert trace["page_contributing_routes"] == {"demo.pdf#page=8": ["original", "semantic_1"]}
+    assert trace["page_fusion_used_for_final_context"] is True
+    assert trace["final_evidence_pack_source"] == "page_fusion"
     assert trace["table_aware_retrieval_mode"] == "force"
     assert trace["table_aware_auto_triggered"] is True
     assert trace["table_aware_trigger_reason"] == ["force"]
@@ -974,6 +982,114 @@ def test_retrieve_candidate_documents_uses_query_planner_and_rrf(monkeypatch):
     }
     assert len(result["meta"]["per_query_retrieval_counts"]) == 5
     assert result["docs"][0]["chunk_id"] == "c1"
+
+
+def test_retrieve_candidate_documents_page_fusion_anchor_guard_filters_cross_anchor_pages(monkeypatch):
+    module = _install_rag_utils_stubs()
+
+    monkeypatch.setenv("RAG_QUERY_PLANNER_ENABLED", "true")
+    monkeypatch.setattr(
+        module,
+        "plan_retrieval_queries",
+        lambda question: {
+            "enabled": True,
+            "intent": "numeric_lookup",
+            "must_keep_terms": ["Adobe", "2022"],
+            "semantic_queries": ["Adobe operating margin 2022"],
+            "evidence_field_queries": ["Adobe revenue income from operations 2022"],
+            "table_heading_queries": [],
+            "keyword_queries": [],
+            "planner_validation_dropped_queries": [],
+            "expected_evidence_type": "text",
+            "constraints": [],
+            "parse_error": "",
+        },
+    )
+
+    def _fake_retrieve_leaf_chunks(query, top_k, filter_expr, retrieval_scope):
+        docs_map = {
+            "What was Adobe operating margin in 2022?": [
+                {"filename": "1.pdf", "page_number": 8, "chunk_id": "c1", "text": "Adobe operating margin was 35% in 2022.", "score": 0.6},
+                {"filename": "2.pdf", "page_number": 4, "chunk_id": "c2", "text": "Ulta margin was 12% in 2022.", "score": 0.9},
+            ],
+            "Adobe operating margin 2022": [
+                {"filename": "1.pdf", "page_number": 8, "chunk_id": "c3", "text": "Adobe revenue and income from operations for 2022.", "score": 0.5},
+            ],
+            "Adobe revenue income from operations 2022": [
+                {"filename": "1.pdf", "page_number": 8, "chunk_id": "c4", "text": "Statements of income Adobe 2022 revenue income from operations.", "score": 0.4},
+            ],
+        }
+        return {"docs": docs_map.get(query, []), "meta": {"retrieval_mode": "hybrid"}}
+
+    monkeypatch.setattr(module, "_retrieve_leaf_chunks", _fake_retrieve_leaf_chunks)
+
+    result = module.retrieve_candidate_documents("What was Adobe operating margin in 2022?", candidate_k=5)
+
+    assert result["meta"]["page_level_fusion_enabled"] is True
+    assert result["meta"]["page_anchor_filtered_count"] == 1
+    assert result["meta"]["fused_top_pages"][0]["filename"] == "1.pdf"
+    assert result["meta"]["fused_pages_after_anchor_guard"][0]["filename"] == "1.pdf"
+    assert all(page["filename"] == "1.pdf" for page in result["meta"]["fused_pages_after_anchor_guard"])
+
+
+def test_finalize_retrieved_documents_prefers_page_fusion_for_final_context(monkeypatch):
+    module = _install_rag_utils_stubs()
+    monkeypatch.setenv("RAG_PAGE_LEVEL_FUSION", "true")
+
+    docs = [
+        {
+            "filename": "1.pdf",
+            "doc_name": "1",
+            "page_number": 8,
+            "chunk_id": "c1",
+            "text": "Adobe operating margin was 35% in 2022.",
+            "evidence_type": "text_chunk",
+            "score": 0.9,
+            "page_fused_rank": 1,
+            "page_fused_score": 1.4,
+            "page_contributing_routes": ["original", "semantic_1"],
+            "page_matched_queries": ["What was Adobe operating margin in 2022?"],
+        },
+        {
+            "filename": "1.pdf",
+            "doc_name": "1",
+            "page_number": 8,
+            "chunk_id": "c2",
+            "text": "Adobe income from operations and revenue are reported here.",
+            "evidence_type": "text_chunk",
+            "score": 0.8,
+            "page_fused_rank": 1,
+            "page_fused_score": 1.4,
+            "page_contributing_routes": ["original", "evidence_field_1"],
+            "page_matched_queries": ["Adobe revenue income from operations 2022"],
+        },
+        {
+            "filename": "2.pdf",
+            "doc_name": "2",
+            "page_number": 4,
+            "chunk_id": "c3",
+            "text": "Ulta margin was 12% in 2022.",
+            "evidence_type": "text_chunk",
+            "score": 0.95,
+            "page_fused_rank": 2,
+            "page_fused_score": 0.7,
+            "page_contributing_routes": ["original"],
+            "page_matched_queries": ["What was Adobe operating margin in 2022?"],
+        },
+    ]
+
+    result = module.finalize_retrieved_documents(
+        "What was Adobe operating margin in 2022?",
+        docs,
+        final_top_k=2,
+        enable_page_merge=False,
+    )
+
+    assert result["meta"]["page_fusion_used_for_final_context"] is True
+    assert result["meta"]["final_evidence_pack_source"] == "page_fusion"
+    assert result["meta"]["selected_pages"][0]["filename"] == "1.pdf"
+    assert result["final_retrieved_docs"][0]["filename"] == "1.pdf"
+    assert result["final_retrieved_docs"][1]["filename"] == "1.pdf"
 
 
 def test_retrieve_candidate_documents_planner_failure_falls_back_to_original_query(monkeypatch):

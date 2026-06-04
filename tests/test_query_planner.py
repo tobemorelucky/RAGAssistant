@@ -99,3 +99,32 @@ def test_plan_retrieval_queries_allows_evidence_fields_without_repeating_all_num
     ]
     assert plan["table_heading_queries"] == ["AMD balance sheet current assets current liabilities 2022"]
     assert plan["keyword_queries"] == ["AMD quick ratio 2022"]
+
+
+def test_plan_retrieval_queries_prompt_requests_evidence_fields(monkeypatch):
+    module = _load_query_planner()
+    captured = {}
+
+    class _FakeModel:
+        def invoke(self, messages):
+            captured["messages"] = messages
+            payload = {
+                "intent": "numeric_lookup",
+                "must_keep_terms": ["Adobe", "2022"],
+                "semantic_queries": ["Adobe operating margin 2022"],
+                "evidence_field_queries": ["Adobe revenue income from operations 2022"],
+                "table_heading_queries": ["Adobe statements of income 2022"],
+                "keyword_queries": ["Adobe margin 2022"],
+                "expected_evidence_type": "table_or_text",
+                "constraints": [],
+            }
+            return types.SimpleNamespace(content=json.dumps(payload))
+
+    monkeypatch.setattr(module, "_get_planner_model", lambda: _FakeModel())
+
+    module.plan_retrieval_queries("What was Adobe operating margin in 2022?")
+
+    system_prompt = captured["messages"][0]["content"]
+    assert "underlying fields needed to compute or verify the metric" in system_prompt
+    assert "likely numerator and denominator fields" in system_prompt
+    assert "Do not merely paraphrase the original question." in system_prompt

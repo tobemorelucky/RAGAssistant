@@ -90,7 +90,11 @@ class RagTrace(BaseModel):
     page_level_fusion_enabled: Optional[bool] = None
     fused_page_count: Optional[int] = None
     fused_top_pages: Optional[List[dict]] = None
+    fused_pages_after_anchor_guard: Optional[List[dict]] = None
+    page_anchor_filtered_count: Optional[int] = None
     page_contributing_routes: Optional[dict] = None
+    page_fusion_used_for_final_context: Optional[bool] = None
+    final_evidence_pack_source: Optional[str] = None
     candidate_k: Optional[int] = None
     final_top_k: Optional[int] = None
     two_stage_retrieval: Optional[bool] = None

@@ -1630,6 +1630,7 @@ def _fuse_retrieval_pages(
                     "contributing_routes": [],
                     "matched_queries": [],
                     "top_chunks": [],
+                    "page_text": [],
                 },
             )
             entry["page_score"] += contribution
@@ -1637,6 +1638,8 @@ def _fuse_retrieval_pages(
                 entry["contributing_routes"].append(label)
             if query and query not in entry["matched_queries"]:
                 entry["matched_queries"].append(query)
+            if doc.get("text"):
+                entry["page_text"].append(doc.get("text", "") or "")
             entry["top_chunks"].append(
                 {
                     "chunk_id": doc.get("chunk_id", "") or "",
@@ -1653,7 +1656,56 @@ def _fuse_retrieval_pages(
             key=lambda item: float(item.get("score", 0.0) or 0.0),
             reverse=True,
         )[:3]
+        entry["page_text"] = "\n".join(entry.get("page_text", [])[:5])
     return ordered
+
+
+def _fused_page_matches_query_anchors(page_entry: dict, query_anchors: List[str]) -> bool:
+    if not query_anchors:
+        return True
+    haystack_parts = [
+        page_entry.get("page_text", "") or "",
+    ]
+    for chunk in page_entry.get("top_chunks", []) or []:
+        haystack_parts.append(chunk.get("text", "") or "")
+    haystack = "\n".join(haystack_parts)
+    return any(_anchor_in_text(anchor, haystack) for anchor in query_anchors)
+
+
+def _apply_anchor_guard_to_fused_pages(
+    fused_pages: list[dict],
+    route_results: list[dict],
+    query_anchors: List[str],
+) -> tuple[list[dict], dict]:
+    if not query_anchors:
+        return fused_pages, {
+            "page_anchor_filtered_count": 0,
+            "fused_pages_after_anchor_guard": fused_pages,
+            "page_anchor_guard_fallback_reason": "",
+        }
+    all_docs = []
+    for route in route_results:
+        all_docs.extend(route.get("docs") or [])
+    anchor_filename_hits = _build_anchor_matched_filename_stats(all_docs, query_anchors)
+    filtered: list[dict] = []
+    filtered_count = 0
+    for page in fused_pages:
+        filename = (page.get("filename") or "").strip()
+        if _fused_page_matches_query_anchors(page, query_anchors) or anchor_filename_hits.get(filename, 0) >= 2:
+            filtered.append(page)
+        else:
+            filtered_count += 1
+    if filtered:
+        return filtered, {
+            "page_anchor_filtered_count": filtered_count,
+            "fused_pages_after_anchor_guard": filtered,
+            "page_anchor_guard_fallback_reason": "",
+        }
+    return fused_pages, {
+        "page_anchor_filtered_count": filtered_count,
+        "fused_pages_after_anchor_guard": fused_pages,
+        "page_anchor_guard_fallback_reason": "anchor_guard_empty_fallback",
+    }
 
 
 def _apply_page_level_fusion(
@@ -1661,22 +1713,37 @@ def _apply_page_level_fusion(
     route_results: list[dict],
     *,
     candidate_k: int,
-) -> tuple[list[dict], list[dict]]:
+) -> tuple[list[dict], list[dict], dict]:
     fused_pages = _fuse_retrieval_pages(route_results)
     if not fused_pages:
-        return fused_docs[:candidate_k], []
+        return fused_docs[:candidate_k], [], {
+            "page_anchor_filtered_count": 0,
+            "fused_pages_after_anchor_guard": [],
+            "page_anchor_guard_fallback_reason": "",
+        }
+
+    query_anchors = []
+    for route in route_results:
+        if route.get("category") == "original":
+            query_anchors = extract_query_anchors(route.get("query") or "")
+            break
+    guarded_pages, guard_meta = _apply_anchor_guard_to_fused_pages(
+        fused_pages,
+        route_results,
+        query_anchors,
+    )
 
     page_rank_map = {
         (entry["filename"], entry["page_number"]): index
-        for index, entry in enumerate(fused_pages, 1)
+        for index, entry in enumerate(guarded_pages, 1)
     }
     page_score_map = {
         (entry["filename"], entry["page_number"]): float(entry.get("page_score", 0.0) or 0.0)
-        for entry in fused_pages
+        for entry in guarded_pages
     }
     page_meta_map = {
         (entry["filename"], entry["page_number"]): entry
-        for entry in fused_pages
+        for entry in guarded_pages
     }
 
     prioritized_docs: list[dict] = []
@@ -1704,7 +1771,53 @@ def _apply_page_level_fusion(
             -float(item.get("rerank_score", 0.0) or 0.0),
         )
     )
-    return prioritized_docs[:candidate_k], fused_pages
+    return prioritized_docs[:candidate_k], guarded_pages, guard_meta
+
+
+def _select_docs_from_fused_pages(
+    docs: List[dict],
+    *,
+    final_top_k: int,
+    max_per_page: int = 2,
+) -> tuple[List[dict], List[dict], bool]:
+    page_docs = [doc for doc in docs or [] if doc.get("page_fused_rank") is not None]
+    if not page_docs:
+        return [], [], False
+
+    ordered_docs = sorted(
+        page_docs,
+        key=lambda item: (
+            int(item.get("page_fused_rank", 10**9)),
+            -float(item.get("page_fused_score", 0.0) or 0.0),
+            -_combined_score(item),
+        ),
+    )
+    selected: list[dict] = []
+    page_counts: dict[tuple[str, int], int] = {}
+    selected_pages: list[dict] = []
+    seen_pages: set[tuple[str, int]] = set()
+    for doc in ordered_docs:
+        page_key = _page_fusion_key(doc)
+        if page_key is None:
+            continue
+        if page_counts.get(page_key, 0) >= max_per_page:
+            continue
+        selected.append(doc)
+        page_counts[page_key] = page_counts.get(page_key, 0) + 1
+        if page_key not in seen_pages:
+            seen_pages.add(page_key)
+            selected_pages.append(
+                {
+                    "filename": page_key[0],
+                    "page_number": page_key[1],
+                    "page_score": float(doc.get("page_fused_score", 0.0) or 0.0),
+                    "contributing_routes": doc.get("page_contributing_routes", []) or [],
+                    "matched_queries": doc.get("page_matched_queries", []) or [],
+                }
+            )
+        if len(selected) >= final_top_k:
+            break
+    return selected, selected_pages, bool(selected_pages)
 
 
 def _should_trigger_two_stage_fallback(page_stage_candidates: List[dict], final_top_k: int, query: str) -> bool:
@@ -2329,6 +2442,9 @@ def retrieve_candidate_documents(query: str, candidate_k: int | None = None) -> 
         "page_level_fusion_enabled": False,
         "fused_page_count": 0,
         "fused_top_pages": [],
+        "fused_pages_after_anchor_guard": [],
+        "page_anchor_filtered_count": 0,
+        "page_anchor_guard_fallback_reason": "",
         "page_contributing_routes": {},
         "retrieve_error": None,
         "rerank_enabled": bool(RERANK_MODEL and RERANK_API_KEY and RERANK_BINDING_HOST),
@@ -2383,7 +2499,7 @@ def retrieve_candidate_documents(query: str, candidate_k: int | None = None) -> 
     fused_docs_all = _rrf_fuse_retrieval_routes(route_results)
     page_level_fusion_enabled = planner_enabled and _is_page_level_fusion_enabled()
     if page_level_fusion_enabled:
-        fused_docs, fused_pages = _apply_page_level_fusion(
+        fused_docs, fused_pages, page_guard_meta = _apply_page_level_fusion(
             fused_docs_all,
             route_results,
             candidate_k=candidate_k,
@@ -2391,6 +2507,11 @@ def retrieve_candidate_documents(query: str, candidate_k: int | None = None) -> 
     else:
         fused_docs = fused_docs_all[:candidate_k]
         fused_pages = []
+        page_guard_meta = {
+            "page_anchor_filtered_count": 0,
+            "fused_pages_after_anchor_guard": [],
+            "page_anchor_guard_fallback_reason": "",
+        }
     meta = {
         **base_meta,
         **last_meta,
@@ -2419,6 +2540,18 @@ def retrieve_candidate_documents(query: str, candidate_k: int | None = None) -> 
             }
             for entry in fused_pages[:candidate_k]
         ],
+        "fused_pages_after_anchor_guard": [
+            {
+                "filename": entry.get("filename", "") or "",
+                "page_number": entry.get("page_number", ""),
+                "page_score": entry.get("page_score", 0.0),
+                "matched_queries": entry.get("matched_queries", []) or [],
+                "contributing_routes": entry.get("contributing_routes", []) or [],
+            }
+            for entry in (page_guard_meta.get("fused_pages_after_anchor_guard", []) or [])[:candidate_k]
+        ],
+        "page_anchor_filtered_count": page_guard_meta.get("page_anchor_filtered_count", 0),
+        "page_anchor_guard_fallback_reason": page_guard_meta.get("page_anchor_guard_fallback_reason", ""),
         "page_contributing_routes": {
             f"{entry.get('filename', '')}#page={entry.get('page_number', '')}": entry.get("contributing_routes", []) or []
             for entry in fused_pages[:candidate_k]
@@ -2757,6 +2890,8 @@ def finalize_retrieved_documents(
         "cover_page_filtered_count": 0,
         "fallback_used": False,
         "fallback_reason": "",
+        "page_fusion_used_for_final_context": False,
+        "final_evidence_pack_source": "chunk_rerank_fallback",
     }
     rerank_meta: Dict[str, Any]
     if experimental_mode:
@@ -2856,7 +2991,24 @@ def finalize_retrieved_documents(
         )
         stage_two_meta["anchor_guard_applied"] = anchor_guard_applied
         stage_two_meta["anchor_filtered_count"] = anchor_filtered_count
-        final_docs, merge_meta = _auto_merge_documents(docs=reranked_docs, top_k=final_top_k)
+        page_fusion_selected_docs, selected_pages, page_fusion_used = _select_docs_from_fused_pages(
+            reranked_docs,
+            final_top_k=final_top_k,
+        )
+        stage_two_meta["selected_pages"] = selected_pages
+        if page_fusion_used:
+            final_docs = page_fusion_selected_docs
+            merge_meta = {
+                "auto_merge_enabled": AUTO_MERGE_ENABLED,
+                "auto_merge_applied": False,
+                "auto_merge_threshold": AUTO_MERGE_THRESHOLD,
+                "auto_merge_replaced_chunks": 0,
+                "auto_merge_steps": 0,
+            }
+            stage_two_meta["page_fusion_used_for_final_context"] = True
+            stage_two_meta["final_evidence_pack_source"] = "page_fusion"
+        else:
+            final_docs, merge_meta = _auto_merge_documents(docs=reranked_docs, top_k=final_top_k)
         if len(final_docs) < final_top_k and len(reranked_docs) >= final_top_k:
             final_docs = reranked_docs[:final_top_k]
             merge_meta = {
@@ -2865,6 +3017,9 @@ def finalize_retrieved_documents(
                 "auto_merge_replaced_chunks": 0,
                 "auto_merge_steps": 0,
             }
+            stage_two_meta["selected_pages"] = []
+            stage_two_meta["page_fusion_used_for_final_context"] = False
+            stage_two_meta["final_evidence_pack_source"] = "chunk_rerank_fallback"
         context_docs, page_merge_meta = _merge_context_chunks(
             final_docs,
             enable_page_merge=enable_page_merge,
@@ -3003,7 +3158,11 @@ def debug_retrieval_pipeline(question: str, top_k: int = 10) -> Dict[str, Any]:
             "page_level_fusion_enabled": meta.get("page_level_fusion_enabled", False),
             "fused_page_count": meta.get("fused_page_count", 0),
             "fused_top_pages": meta.get("fused_top_pages", []) or [],
+            "fused_pages_after_anchor_guard": meta.get("fused_pages_after_anchor_guard", []) or [],
+            "page_anchor_filtered_count": meta.get("page_anchor_filtered_count", 0),
             "page_contributing_routes": meta.get("page_contributing_routes", {}) or {},
+            "page_fusion_used_for_final_context": meta.get("page_fusion_used_for_final_context", False),
+            "final_evidence_pack_source": meta.get("final_evidence_pack_source", "chunk_rerank_fallback"),
             "table_aware_retrieval_mode": meta.get("table_aware_retrieval_mode", "off"),
             "table_aware_auto_triggered": meta.get("table_aware_auto_triggered", False),
             "table_aware_trigger_reason": meta.get("table_aware_trigger_reason", []) or [],
