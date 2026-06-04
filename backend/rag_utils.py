@@ -254,6 +254,29 @@ def _retrieved_docs_trigger_table_aware_retrieval(docs: List[dict]) -> tuple[boo
     return False, []
 
 
+def _extract_table_candidate_filenames(docs: List[dict], max_files: int = 3) -> list[str]:
+    out: list[str] = []
+    seen = set()
+    for doc in docs or []:
+        filename = (doc.get("filename") or "").strip()
+        if not filename or filename in seen:
+            continue
+        seen.add(filename)
+        out.append(filename)
+        if len(out) >= max(1, max_files):
+            break
+    return out
+
+
+def _build_table_evidence_filter_expr(candidate_filenames: List[str]) -> str:
+    base_expr = 'evidence_type != "text_chunk"'
+    filenames = [name for name in candidate_filenames if name]
+    if not filenames:
+        return base_expr
+    quoted = ", ".join(f'"{_escape_milvus_string(name)}"' for name in filenames)
+    return f"{base_expr} and filename in [{quoted}]"
+
+
 def _should_enable_table_aware_retrieval(query: str, retrieved_docs: List[dict], mode: str) -> tuple[bool, bool, list[str]]:
     if mode == "off":
         return False, False, []
@@ -1469,6 +1492,7 @@ def _merge_context_chunks(
 
 def _build_table_context_doc(query: str, retrieved_docs: List[dict] | None = None) -> Tuple[dict | None, Dict[str, Any]]:
     config = get_table_aware_retrieval_config()
+    candidate_filenames = _extract_table_candidate_filenames(list(retrieved_docs or []), max_files=3)
     should_enable, auto_triggered, trigger_reasons = _should_enable_table_aware_retrieval(
         query,
         list(retrieved_docs or []),
@@ -1481,18 +1505,20 @@ def _build_table_context_doc(query: str, retrieved_docs: List[dict] | None = Non
         "table_evidence_hit_count": 0,
         "table_context_table_count": 0,
         "table_context_char_count": 0,
+        "table_candidate_filenames": candidate_filenames,
         "table_ids": [],
     }
     if not should_enable:
         return None, base_meta
 
     try:
+        filter_expr = _build_table_evidence_filter_expr(candidate_filenames)
         dense_embeddings, sparse_embeddings = _embedding_service.get_all_embeddings([query])
         hits = _milvus_manager.hybrid_retrieve(
             dense_embedding=dense_embeddings[0],
             sparse_embedding=sparse_embeddings[0],
             top_k=config["top_k"],
-            filter_expr='evidence_type != "text_chunk"',
+            filter_expr=filter_expr,
         )
         table_ids = _dedupe_table_ids_for_context(hits)[: config["max_tables"]]
         selected_hits = [hit for hit in hits if (hit.get("table_id") or "") in set(table_ids)]
@@ -1806,6 +1832,7 @@ def debug_retrieval_pipeline(question: str, top_k: int = 10) -> Dict[str, Any]:
             "table_evidence_hit_count": meta.get("table_evidence_hit_count", 0),
             "table_context_table_count": meta.get("table_context_table_count", 0),
             "table_context_char_count": meta.get("table_context_char_count", 0),
+            "table_candidate_filenames": meta.get("table_candidate_filenames", []) or [],
             "table_ids": meta.get("table_ids", []) or [],
             "two_stage_retrieval": meta.get("two_stage_retrieval", False),
             "selected_docs": meta.get("selected_docs", []) or meta.get("doc_stage_selected_docs", []) or [],

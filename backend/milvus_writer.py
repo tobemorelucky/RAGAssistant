@@ -1,7 +1,12 @@
 """文档向量化并写入 Milvus - 支持密集+稀疏向量"""
+import os
+
 from embedding import EmbeddingService, embedding_service as _default_embedding_service
 from milvus_client import MilvusManager
 from text_sanitizer import sanitize_text
+
+_DEFAULT_MILVUS_TEXT_MAX_LENGTH = 7500
+_TRUNCATION_SUFFIX = " ... [truncated]"
 
 
 class MilvusWriter:
@@ -10,6 +15,25 @@ class MilvusWriter:
     def __init__(self, embedding_service: EmbeddingService = None, milvus_manager: MilvusManager = None):
         self.embedding_service = embedding_service or _default_embedding_service
         self.milvus_manager = milvus_manager or MilvusManager()
+
+    @staticmethod
+    def _get_text_max_length() -> int:
+        raw_value = os.getenv("MILVUS_TEXT_MAX_LENGTH")
+        try:
+            limit = int(raw_value) if raw_value is not None else _DEFAULT_MILVUS_TEXT_MAX_LENGTH
+        except (TypeError, ValueError):
+            limit = _DEFAULT_MILVUS_TEXT_MAX_LENGTH
+        return limit if limit > 0 else _DEFAULT_MILVUS_TEXT_MAX_LENGTH
+
+    @classmethod
+    def _sanitize_and_trim_text(cls, text: str) -> str:
+        sanitized = sanitize_text(text or "")
+        limit = cls._get_text_max_length()
+        if len(sanitized) <= limit:
+            return sanitized
+        if limit <= len(_TRUNCATION_SUFFIX):
+            return _TRUNCATION_SUFFIX[:limit]
+        return sanitized[: limit - len(_TRUNCATION_SUFFIX)] + _TRUNCATION_SUFFIX
 
     def write_documents(self, documents: list[dict], batch_size: int = 50, progress_callback=None):
         """
@@ -22,7 +46,7 @@ class MilvusWriter:
 
         self.milvus_manager.init_collection()
 
-        sanitized_documents = [{**doc, "text": sanitize_text(doc.get("text", ""))} for doc in documents]
+        sanitized_documents = [{**doc, "text": self._sanitize_and_trim_text(doc.get("text", ""))} for doc in documents]
         all_texts = [doc["text"] for doc in sanitized_documents]
         self.embedding_service.increment_add_documents(all_texts)
 

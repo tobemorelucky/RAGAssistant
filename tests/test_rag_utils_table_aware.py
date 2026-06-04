@@ -219,6 +219,70 @@ def test_table_aware_retrieval_force_dedupes_ids_and_limits_tables(monkeypatch):
     assert "Additional structured table evidence:" in doc["text"]
 
 
+def test_table_aware_retrieval_uses_candidate_filename_filter(monkeypatch):
+    module = _install_rag_utils_stubs()
+
+    class _FakeMilvus:
+        def hybrid_retrieve(self, **kwargs):
+            assert (
+                kwargs["filter_expr"]
+                == 'evidence_type != "text_chunk" and filename in ["JPMORGAN_2021Q1_10Q.pdf", "JPMORGAN_2021_10K.pdf"]'
+            )
+            return []
+
+    monkeypatch.setattr(module, "_milvus_manager", _FakeMilvus())
+    monkeypatch.setattr(module, "_table_store", type("_FakeTableStore", (), {"get_tables_by_ids": lambda self, ids: []})())
+    monkeypatch.setenv("TABLE_AWARE_RETRIEVAL", "force")
+
+    doc, meta = module._build_table_context_doc(
+        "conference call number",
+        retrieved_docs=[
+            {"filename": "JPMORGAN_2021Q1_10Q.pdf"},
+            {"filename": "JPMORGAN_2021Q1_10Q.pdf"},
+            {"filename": "JPMORGAN_2021_10K.pdf"},
+        ],
+    )
+
+    assert doc is None
+    assert meta["table_candidate_filenames"] == ["JPMORGAN_2021Q1_10Q.pdf", "JPMORGAN_2021_10K.pdf"]
+
+
+def test_table_aware_retrieval_candidate_filenames_are_ranked_deduped_and_limited(monkeypatch):
+    module = _install_rag_utils_stubs()
+    monkeypatch.setenv("TABLE_AWARE_RETRIEVAL", "force")
+
+    filenames = module._extract_table_candidate_filenames(
+        [
+            {"filename": "ADOBE_2022_10K.pdf"},
+            {"filename": "ADOBE_2022_10K.pdf"},
+            {"filename": "ADOBE_2021_10K.pdf"},
+            {"filename": "AES_2022_10K.pdf"},
+            {"filename": "EXTRA.pdf"},
+        ],
+        max_files=3,
+    )
+
+    assert filenames == ["ADOBE_2022_10K.pdf", "ADOBE_2021_10K.pdf", "AES_2022_10K.pdf"]
+
+
+def test_table_aware_retrieval_falls_back_to_global_when_no_candidate_filenames(monkeypatch):
+    module = _install_rag_utils_stubs()
+
+    class _FakeMilvus:
+        def hybrid_retrieve(self, **kwargs):
+            assert kwargs["filter_expr"] == 'evidence_type != "text_chunk"'
+            return []
+
+    monkeypatch.setattr(module, "_milvus_manager", _FakeMilvus())
+    monkeypatch.setattr(module, "_table_store", type("_FakeTableStore", (), {"get_tables_by_ids": lambda self, ids: []})())
+    monkeypatch.setenv("TABLE_AWARE_RETRIEVAL", "force")
+
+    doc, meta = module._build_table_context_doc("net sales", retrieved_docs=[{"filename": ""}, {"text": "chunk"}])
+
+    assert doc is None
+    assert meta["table_candidate_filenames"] == []
+
+
 def test_table_context_respects_max_context_chars(monkeypatch):
     module = _install_rag_utils_stubs()
 
@@ -284,6 +348,7 @@ def test_debug_retrieval_pipeline_exposes_table_aware_trace_fields(monkeypatch):
                 "table_evidence_hit_count": 2,
                 "table_context_table_count": 1,
                 "table_context_char_count": 321,
+                "table_candidate_filenames": ["demo.pdf"],
                 "table_ids": ["t1"],
                 "latency_breakdown": {"total_retrieval_ms": 12.3},
             },
@@ -299,4 +364,5 @@ def test_debug_retrieval_pipeline_exposes_table_aware_trace_fields(monkeypatch):
     assert trace["table_evidence_hit_count"] == 2
     assert trace["table_context_table_count"] == 1
     assert trace["table_context_char_count"] == 321
+    assert trace["table_candidate_filenames"] == ["demo.pdf"]
     assert trace["table_ids"] == ["t1"]

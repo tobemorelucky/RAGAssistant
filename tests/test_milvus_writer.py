@@ -105,3 +105,61 @@ def test_write_documents_keeps_table_evidence_metadata():
     assert inserted["row_id"] == "row_2"
     assert inserted["table_title"] == "Condensed Statements"
     assert inserted["chunk_id"] == "demo::1::row::row_2"
+
+
+def test_write_documents_truncates_long_text_and_uses_trimmed_text_for_embeddings(monkeypatch):
+    module = _load_milvus_writer_module()
+    embedding_service = _FakeEmbeddingService()
+    milvus_manager = _FakeMilvusManager()
+    writer = module.MilvusWriter(embedding_service=embedding_service, milvus_manager=milvus_manager)
+    long_text = "A" * 30
+
+    monkeypatch.setenv("MILVUS_TEXT_MAX_LENGTH", "20")
+
+    writer.write_documents(
+        [
+            {
+                "text": long_text,
+                "filename": "demo.pdf",
+                "file_type": "PDF",
+                "chunk_id": "chunk-1",
+                "parent_chunk_id": "",
+                "root_chunk_id": "",
+                "chunk_level": 3,
+            }
+        ]
+    )
+
+    expected_text = "AAAA ... [truncated]"
+    assert embedding_service.increment_calls == [[expected_text]]
+    assert embedding_service.embedding_calls == [[expected_text]]
+    inserted = milvus_manager.insert_calls[0][0]
+    assert inserted["text"] == expected_text
+
+
+def test_write_documents_keeps_short_text_unchanged(monkeypatch):
+    module = _load_milvus_writer_module()
+    embedding_service = _FakeEmbeddingService()
+    milvus_manager = _FakeMilvusManager()
+    writer = module.MilvusWriter(embedding_service=embedding_service, milvus_manager=milvus_manager)
+
+    monkeypatch.setenv("MILVUS_TEXT_MAX_LENGTH", "20")
+
+    writer.write_documents(
+        [
+            {
+                "text": "Short text",
+                "filename": "demo.pdf",
+                "file_type": "PDF",
+                "chunk_id": "chunk-1",
+                "parent_chunk_id": "",
+                "root_chunk_id": "",
+                "chunk_level": 3,
+            }
+        ]
+    )
+
+    assert embedding_service.increment_calls == [["Short text"]]
+    assert embedding_service.embedding_calls == [["Short text"]]
+    inserted = milvus_manager.insert_calls[0][0]
+    assert inserted["text"] == "Short text"

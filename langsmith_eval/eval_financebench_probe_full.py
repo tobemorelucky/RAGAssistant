@@ -18,7 +18,7 @@ from openai import OpenAI
 # 0. 基础配置
 # ============================================================
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(PROJECT_ROOT / ".env", override=True)
 
 # 小样本 probe10，后面如果要跑完整 100 条，改成 financebench_top40_100_v2
@@ -49,7 +49,7 @@ chat_with_agent = None
 if RAG_TARGET_MODE == "import":
     backend_path = PROJECT_ROOT / "backend"
     if str(backend_path) not in sys.path:
-        sys.path.append(str(backend_path))
+        sys.path.insert(0, str(backend_path))
 
     chat_with_agent = importlib.import_module("agent").chat_with_agent
 

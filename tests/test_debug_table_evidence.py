@@ -53,6 +53,7 @@ def test_build_report_contains_evidence_preview():
         ],
         max_tables=20,
         max_docs=30,
+        preview_chars=240,
         runtime_config={"backend": "pdfplumber_words", "max_pages": 8},
     )
 

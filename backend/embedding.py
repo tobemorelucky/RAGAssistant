@@ -13,6 +13,7 @@ from langchain_huggingface import HuggingFaceEmbeddings
 load_dotenv()
 
 _DEFAULT_STATE_PATH = Path(__file__).resolve().parent.parent / "data" / "bm25_state.json"
+_DEFAULT_EMBEDDING_BATCH_SIZE = 8
 
 
 # def _create_dense_embedder() -> HuggingFaceEmbeddings:
@@ -154,6 +155,48 @@ class EmbeddingService:
             return []
         try:
             return self._embedder.embed_documents(texts)
+        except Exception as e:
+            raise Exception(f"本地嵌入模型调用失败: {str(e)}") from e
+
+    def _get_embedding_batch_size(self) -> int:
+        raw_value = os.getenv("EMBEDDING_BATCH_SIZE")
+        try:
+            batch_size = int(raw_value) if raw_value is not None else _DEFAULT_EMBEDDING_BATCH_SIZE
+        except (TypeError, ValueError):
+            batch_size = _DEFAULT_EMBEDDING_BATCH_SIZE
+        return batch_size if batch_size > 0 else _DEFAULT_EMBEDDING_BATCH_SIZE
+
+    def _maybe_empty_cuda_cache(self) -> None:
+        try:
+            import torch  # type: ignore
+        except Exception:
+            return
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            return
+
+    def get_embeddings(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        batch_size = self._get_embedding_batch_size()
+        try:
+            if len(texts) <= batch_size:
+                return self._embedder.embed_documents(texts)
+
+            embeddings: list[list[float]] = []
+            for start in range(0, len(texts), batch_size):
+                end = min(start + batch_size, len(texts))
+                batch = texts[start:end]
+                try:
+                    embeddings.extend(self._embedder.embed_documents(batch))
+                except Exception as e:
+                    raise Exception(
+                        f"本地嵌入模型批处理失败: batch={start + 1}-{end}: {str(e)}"
+                    ) from e
+                self._maybe_empty_cuda_cache()
+            return embeddings
         except Exception as e:
             raise Exception(f"本地嵌入模型调用失败: {str(e)}") from e
 

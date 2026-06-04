@@ -124,10 +124,12 @@ def test_init_collection_schema_includes_table_evidence_fields():
 
     field_names = [name for name, _dtype, _kwargs in fake_client.created_schema.fields]
     field_types = {name: dtype for name, dtype, _kwargs in fake_client.created_schema.fields}
+    field_kwargs = {name: kwargs for name, _dtype, kwargs in fake_client.created_schema.fields}
     assert "evidence_type" in field_names
     assert "table_id" in field_names
     assert "row_id" in field_names
     assert "table_title" in field_names
+    assert field_kwargs["text"]["max_length"] == 8192
     assert field_types["evidence_type"] == module.DataType.VARCHAR
     assert field_types["table_title"] == module.DataType.VARCHAR
 

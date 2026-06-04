@@ -171,12 +171,17 @@ def _install_api_stubs():
 
 
 def _load_api_module():
+    original_sqlalchemy_orm = sys.modules.get("sqlalchemy.orm")
     _install_api_stubs()
     path = Path(__file__).resolve().parents[1] / "backend" / "api.py"
     spec = importlib.util.spec_from_file_location("api_table_evidence_test_module", path)
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
     spec.loader.exec_module(module)
+    if original_sqlalchemy_orm is not None:
+        sys.modules["sqlalchemy.orm"] = original_sqlalchemy_orm
+    else:
+        sys.modules.pop("sqlalchemy.orm", None)
     return module
 
 

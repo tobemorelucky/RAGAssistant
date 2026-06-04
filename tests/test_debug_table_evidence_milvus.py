@@ -99,6 +99,7 @@ def test_search_report_contains_expected_fields():
                 "text": "Document: demo.pdf\nPage: 3\nRow Values: Metric: Net sales; 2023: 120",
             }
         ],
+        preview_chars=240,
     )
 
     assert "query: net sales" in report
